@@ -102,6 +102,46 @@ class ProxySettingsTests(unittest.TestCase):
         system_proxy.disable(self.root)
         self.assertEqual(self.registry.values, {})
 
+    def test_manual_https_proxy_and_ru_bypass_restore_all_four_values(self):
+        self.registry.values['ProxyServer'] = ('http=old-proxy:8080', 1)
+        self.registry.values['ProxyOverride'] = ('*.example.org', 1)
+        before = self.registry.values.copy()
+        system_proxy.enable(self.root, 47831, proxy_port=47830, direct_domains=['*.ru'])
+        self.assertEqual(self.registry.values['ProxyEnable'][0], 1)
+        self.assertEqual(self.registry.values['ProxyServer'][0], 'https=127.0.0.1:47830')
+        self.assertIn('*.ru', self.registry.values['ProxyOverride'][0].split(';'))
+        self.assertNotIn('vk.com', self.registry.values['ProxyOverride'][0])
+        system_proxy.disable(self.root)
+        self.assertEqual(self.registry.values, before)
+
+    def test_old_two_value_backup_migrates_and_restores_new_proxy_values(self):
+        system_proxy.enable(self.root, 47831)
+        backup = self.root / 'proxy-backup.json'
+        saved = json.loads(backup.read_text())
+        for key in ('ProxyServer', 'ProxyOverride'):
+            saved['before'].pop(key, None)
+        backup.write_text(json.dumps(saved))
+        self.registry.values['ProxyServer'] = ('https=old-proxy:443', 1)
+        system_proxy.enable(self.root, 47831, proxy_port=47830, direct_domains=['*.ru'])
+        system_proxy.disable(self.root)
+        self.assertEqual(self.registry.values['ProxyServer'][0], 'https=old-proxy:443')
+        self.assertEqual(self.registry.values['AutoConfigURL'], self.before['AutoConfigURL'])
+
+    def test_external_manual_proxy_edit_is_preserved(self):
+        system_proxy.enable(self.root, 47831, proxy_port=47830)
+        self.registry.values['ProxyServer'] = ('https=new-proxy:443', 1)
+        system_proxy.disable(self.root)
+        self.assertEqual(self.registry.values['ProxyServer'][0], 'https=new-proxy:443')
+        self.assertEqual(self.registry.values['AutoConfigURL'], self.before['AutoConfigURL'])
+
+    def test_manual_activation_preserves_changes_to_previously_unowned_fields(self):
+        self.registry.values['ProxyServer'] = ('https=first-proxy:443', 1)
+        system_proxy.enable(self.root, 47831)
+        self.registry.values['ProxyServer'] = ('https=changed-while-pac-only:443', 1)
+        system_proxy.enable(self.root, 47831, proxy_port=47830)
+        system_proxy.disable(self.root)
+        self.assertEqual(self.registry.values['ProxyServer'][0], 'https=changed-while-pac-only:443')
+
 
 if __name__ == '__main__':
     unittest.main()

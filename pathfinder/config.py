@@ -17,15 +17,17 @@ def endpoint(value):
         raise ValueError("Поддерживаются TLS-порты 443, 8443 и 8080")
     return hostname(host), int(port)
 
-DEFAULT_DIRECT_DOMAINS = [
+LEGACY_DIRECT_DOMAINS = [
     "*.ru", "*.su", "*.xn--p1ai",
     "vk.com", "*.vk.com", "userapi.com", "*.userapi.com",
     "vk-cdn.net", "*.vk-cdn.net", "yastatic.net", "*.yastatic.net",
     "yandex.net", "*.yandex.net",
 ]
+DEFAULT_DIRECT_DOMAINS = ["*.ru"]
 
 DEFAULT = {
     "auto_manage": True,
+    "bypass_only": True,
     "dpi_engine_enabled": True,
     "direct_domains": DEFAULT_DIRECT_DOMAINS,
     "proxy_port": 47830,
@@ -85,9 +87,15 @@ class Config:
         if not self.path.exists():
             atomic_json(self.path, DEFAULT)
         self.data = json.loads(self.path.read_text(encoding="utf-8"))
-        migrate = "direct_domains" not in self.data or "dpi_engine_enabled" not in self.data
+        migrate = any(k not in self.data for k in ("direct_domains", "dpi_engine_enabled", "bypass_only"))
+        if "bypass_only" not in self.data:
+            self.data["auto_manage"] = True
         self.data.setdefault("direct_domains", DEFAULT_DIRECT_DOMAINS.copy())
         self.data.setdefault("dpi_engine_enabled", True)
+        self.data.setdefault("bypass_only", True)
+        if self.data["direct_domains"] == LEGACY_DIRECT_DOMAINS:
+            self.data["direct_domains"] = DEFAULT_DIRECT_DOMAINS.copy()
+            migrate = True
         self.validate()
         if migrate:
             atomic_json(self.path, self.data)
@@ -106,6 +114,8 @@ class Config:
                 raise ValueError("Используйте нормализованные домены direct_domains")
         if type(self.data.get("auto_manage")) is not bool:
             raise ValueError("auto_manage должен быть true или false")
+        if type(self.data["bypass_only"]) is not bool:
+            raise ValueError("bypass_only должен быть true или false")
         if type(self.data["dpi_engine_enabled"]) is not bool:
             raise ValueError("dpi_engine_enabled должен быть true или false")
         for k, low, high in [("proxy_port", 1024, 65535), ("api_port", 1024, 65535),
@@ -169,7 +179,9 @@ class Config:
 
     @property
     def fingerprint(self):
-        relevant = {"probe_policy": 3, "dpi_engine_enabled": self.data["dpi_engine_enabled"],
+        relevant = {"probe_policy": 4, "dpi_engine_enabled": self.data["dpi_engine_enabled"],
+                    "bypass_only": self.data["bypass_only"],
+                    "auto_manage": self.data["auto_manage"],
                     "routes": self.data["routes"], "services": self.data["services"],
                     "direct_domains": self.data["direct_domains"]}
         return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:16]

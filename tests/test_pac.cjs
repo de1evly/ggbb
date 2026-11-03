@@ -39,15 +39,15 @@ test('selected-domain PAC respects domain boundaries', () => {
   }
 });
 
-test('Russian services and VK assets bypass the proxy before any probes', () => {
+test('only ru domains bypass the proxy among public domain suffixes', () => {
   const route = load(true);
-  for (const host of ['vk.com', 'login.vk.com', 'sun1.userapi.com', 'wildberries.ru',
+  for (const host of ['wildberries.ru',
     'www.wildberries.ru', 'wb.ru', 'basket-01.wbbasket.ru', 'gosuslugi.ru',
-    'esia.gosuslugi.ru', 'site.su', 'xn--e1afmkfd.xn--p1ai', 'yastatic.net',
-    'VK.COM', 'vk.com.']) {
+    'esia.gosuslugi.ru', 'GOSUSLUGI.RU', 'gosuslugi.ru.']) {
     assert.equal(route(`https://${host}/`, host), 'DIRECT', host);
   }
-  for (const host of ['fakevk.com', 'vk.com.evil.org', 'gosuslugi.ru.evil.org', 'example.com']) {
+  for (const host of ['vk.com', 'login.vk.com', 'sun1.userapi.com', 'site.su', 'xn--e1afmkfd.xn--p1ai',
+    'yastatic.net', 'VK.COM', 'vk.com.', 'fakevk.com', 'vk.com.evil.org', 'gosuslugi.ru.evil.org', 'example.com']) {
     assert.equal(route(`https://${host}/`, host), 'PROXY 127.0.0.1:47830', host);
   }
 });

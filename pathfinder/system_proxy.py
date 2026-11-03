@@ -7,7 +7,7 @@ from .config import atomic_json, DEFAULT_DIRECT_DOMAINS, TLS_PORTS
 from . import __version__
 
 REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-SETTING_NAMES = ("AutoConfigURL", "ProxyEnable")
+SETTING_NAMES = ("AutoConfigURL", "ProxyEnable", "ProxyServer", "ProxyOverride")
 
 
 def pac_script(config):
@@ -60,20 +60,46 @@ def read_values(key):
     return result
 
 
-def enable(directory, port):
+def write_value(key, name, item):
+    import winreg
+    if item is None:
+        try:
+            winreg.DeleteValue(key, name)
+        except FileNotFoundError:
+            pass
+    else:
+        winreg.SetValueEx(key, name, 0, item["type"], item["value"])
+
+
+def enable(directory, port, proxy_port=None, direct_domains=None):
     require_windows()
     import winreg
     backup = Path(directory) / "proxy-backup.json"
     desired = {"AutoConfigURL": {"value": f"http://127.0.0.1:{port}/proxy.pac?v={__version__}", "type": winreg.REG_SZ},
-               "ProxyEnable": {"value": 0, "type": winreg.REG_DWORD}}
+               "ProxyEnable": {"value": int(proxy_port is not None), "type": winreg.REG_DWORD}}
+    if proxy_port is not None:
+        if type(proxy_port) is not int or not 1024 <= proxy_port <= 65535:
+            raise ValueError("Некорректный порт прокси")
+        bypass = ["<local>", "localhost", "127.*", "[::1]", "10.*", "192.168.*"]
+        bypass += [f"172.{n}.*" for n in range(16, 32)]
+        bypass += list(direct_domains if direct_domains is not None else DEFAULT_DIRECT_DOMAINS)
+        desired.update({"ProxyServer": {"value": f"https=127.0.0.1:{proxy_port}", "type": winreg.REG_SZ},
+                        "ProxyOverride": {"value": ";".join(bypass), "type": winreg.REG_SZ}})
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE) as key:
         current = read_values(key)
         if backup.exists():
             saved = json.loads(backup.read_text(encoding="utf-8"))
             old_url = saved["installed"]["AutoConfigURL"]["value"].split("?", 1)[0]
             new_url = desired["AutoConfigURL"]["value"].split("?", 1)[0]
-            if current != saved["installed"] or old_url != new_url:
+            if any(current[name] != item for name, item in saved["installed"].items()) or old_url != new_url:
                 raise RuntimeError("Настройки прокси изменены извне. Сначала восстановите их через меню или разберите proxy-backup.json")
+            for name in desired:
+                if name not in saved["installed"]:
+                    saved["before"][name] = current[name]
+            # Keep ownership of values written by an earlier activation so exit
+            # restores them even if the user changes scope back to PAC-only.
+            for name, item in saved["installed"].items():
+                desired.setdefault(name, item)
             if desired != saved["installed"]:
                 saved["installed"] = desired
                 atomic_json(backup, saved)
@@ -81,16 +107,13 @@ def enable(directory, port):
             atomic_json(backup, {"before": current, "installed": desired})
         try:
             for name, item in desired.items():
-                winreg.SetValueEx(key, name, 0, item["type"], item["value"])
+                write_value(key, name, item)
         except OSError:
             saved = json.loads(backup.read_text(encoding="utf-8"))
-            for name in SETTING_NAMES:
-                item = saved["before"][name]
+            for name in saved["installed"]:
+                item = saved["before"].get(name)
                 try:
-                    if item is None:
-                        winreg.DeleteValue(key, name)
-                    else:
-                        winreg.SetValueEx(key, name, 0, item["type"], item["value"])
+                    write_value(key, name, item)
                 except OSError:
                     pass  # Durable backup remains for explicit restoration.
             raise
@@ -107,17 +130,10 @@ def disable(directory):
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE) as key:
         current = read_values(key)
         # Restore each value only if still ours; never overwrite another tool's edit.
-        for name in SETTING_NAMES:
+        for name in saved["installed"]:
             if current[name] != saved["installed"][name]:
                 continue
-            item = saved["before"][name]
-            if item is None:
-                try:
-                    winreg.DeleteValue(key, name)
-                except FileNotFoundError:
-                    pass
-            else:
-                winreg.SetValueEx(key, name, 0, item["type"], item["value"])
+            write_value(key, name, saved["before"].get(name))
     backup.unlink()
     notify_windows()
     return True

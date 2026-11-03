@@ -17,6 +17,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.config = Config(self.root / "config.json")
+        self.config.data["bypass_only"] = False
         self.store = Store(self.root / "state.sqlite3")
         self.calls = []
         self.good = {"direct-v4"}
@@ -44,6 +45,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 1)
 
     async def test_domestic_sites_skip_probes_and_saved_external_route(self):
+        self.config.data["direct_domains"].extend(["vk.com", "*.userapi.com"])
         for host in ("vk.com", "www.wildberries.ru", "esia.gosuslugi.ru", "sun1.userapi.com"):
             old_key = (self.engine.key, host)
             self.store.choose(*old_key, "tor-local", 86400)
@@ -63,7 +65,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         data["routes"][-1]["enabled"] = True
         self.config.path.write_text(json.dumps(data))
         migrated = Config(self.config.path)
-        self.assertTrue(migrated.direct("vk.com"))
+        self.assertFalse(migrated.direct("vk.com"))
         self.assertTrue(migrated.direct("gosuslugi.ru"))
         self.assertTrue(migrated.data["routes"][-1]["enabled"])
         self.assertIn("direct_domains", json.loads(self.config.path.read_text()))

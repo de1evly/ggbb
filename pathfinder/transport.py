@@ -1,12 +1,37 @@
 import asyncio
+import base64
+import hashlib
 import ipaddress
+import json
+import os
+import re
 import socket
 import ssl
 import struct
 import time
+import zlib
 from dataclasses import dataclass
 
 STREAM_LIMIT = 256 * 1024
+MAX_PROBE_RESPONSE = 64 * 1024
+MAX_PROBE_HEADERS = 16 * 1024
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+class ProbeFailure(ValueError):
+    """A bounded, non-sensitive reason why an application check failed."""
+    def __init__(self, detail):
+        super().__init__(detail)
+        self.detail = detail
+
+
+@dataclass
+class HTTPResponse:
+    status: int
+    headers: dict
+    body: bytes = b""
+    version: str = "HTTP/1.1"
+    prefix: bool = False
 
 
 async def close(writer):
@@ -114,6 +139,10 @@ class TLSProbe:
         context.set_alpn_protocols(["http/1.1"])
         self.tls = context.wrap_bio(self.incoming, self.outgoing, server_hostname=host)
         self.first = True
+        self.status = None
+        self.buffer = b""
+        self.response_bytes = 0
+        self.websocket_key = None
 
     async def flush(self):
         data = self.outgoing.read()
@@ -139,28 +168,206 @@ class TLSProbe:
             except ssl.SSLWantWriteError:
                 await self.flush()
 
-    async def request(self, path, on_stage=None, port=443):
+    async def read_plain(self):
+        remaining = MAX_PROBE_RESPONSE - self.response_bytes
+        if remaining <= 0:
+            raise ProbeFailure("response_too_large")
+        chunk = await self.operate(lambda: self.tls.read(min(8192, remaining)))
+        self.response_bytes += len(chunk)
+        return chunk
+
+    async def read_until(self, separator, limit, detail):
+        while True:
+            index = self.buffer.find(separator)
+            if index >= 0:
+                end = index + len(separator)
+                if end > limit:
+                    raise ProbeFailure(detail)
+                result, self.buffer = self.buffer[:index], self.buffer[end:]
+                return result
+            if len(self.buffer) >= limit:
+                raise ProbeFailure(detail)
+            chunk = await self.read_plain()
+            if not chunk:
+                raise EOFError("Incomplete HTTP response")
+            self.buffer += chunk
+
+    async def read_exactly(self, size):
+        if size < 0 or size > MAX_PROBE_RESPONSE:
+            raise ProbeFailure("response_too_large")
+        while len(self.buffer) < size:
+            chunk = await self.read_plain()
+            if not chunk:
+                raise EOFError("Incomplete HTTP body")
+            self.buffer += chunk
+        result, self.buffer = self.buffer[:size], self.buffer[size:]
+        return result
+
+    @staticmethod
+    def parse_headers(raw):
+        lines = raw.split(b"\r\n")
+        line = lines.pop(0).split(b" ", 2)
+        if (len(line) < 2 or line[0] not in (b"HTTP/1.0", b"HTTP/1.1")
+                or len(line[1]) != 3 or not line[1].isdigit()
+                or not 100 <= int(line[1]) <= 599):
+            raise ProbeFailure("invalid_http")
+        status = int(line[1])
+        headers = {}
+        for line in lines:
+            name, separator, value = line.partition(b":")
+            if (not separator or not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name)
+                    or any(byte < 32 and byte != 9 or byte == 127 for byte in value)):
+                raise ProbeFailure("invalid_http")
+            name, value = name.decode("ascii").lower(), value.strip().decode("latin-1")
+            headers.setdefault(name, []).append(value)
+        return status, headers
+
+    def remaining_plain(self):
+        """Bytes available within the cap, including already buffered plaintext."""
+        return len(self.buffer) + MAX_PROBE_RESPONSE - self.response_bytes
+
+    async def read_body(self, response, allow_prefix=False):
+        headers = response.headers
+        if response.status in (204, 304) or response.status < 200:
+            return b""
+        lengths, encodings = headers.get("content-length", []), headers.get("transfer-encoding", [])
+        if lengths and encodings:
+            raise ProbeFailure("ambiguous_framing")
+        if encodings:
+            if len(encodings) != 1 or encodings[0].lower() != "chunked":
+                raise ProbeFailure("transfer_encoding_unsupported")
+            chunks, size = [], 0
+            while True:
+                try:
+                    line = await self.read_until(b"\r\n", 1024, "invalid_chunk")
+                except ProbeFailure as error:
+                    if allow_prefix and chunks and error.detail == "response_too_large":
+                        response.prefix = True
+                        break
+                    raise
+                number = line.split(b";", 1)[0]
+                if not re.fullmatch(rb"[0-9a-fA-F]{1,16}", number):
+                    raise ProbeFailure("invalid_chunk")
+                length = int(number, 16)
+                if size + length > MAX_PROBE_RESPONSE and not allow_prefix:
+                    raise ProbeFailure("response_too_large")
+                if length == 0:
+                    # Trailer bytes share the response limit. Reject malformed
+                    # trailers instead of accepting a truncated chunk stream.
+                    while True:
+                        trailer = await self.read_until(b"\r\n", MAX_PROBE_HEADERS, "headers_too_large")
+                        if not trailer:
+                            break
+                        self.parse_headers(b"HTTP/1.1 200 OK\r\n" + trailer)
+                    break
+                if allow_prefix and length >= self.remaining_plain():
+                    # A known marker may be checked in an explicitly partial
+                    # response. Stop at the cap before any further HTTP bytes.
+                    chunks.append(await self.read_exactly(self.remaining_plain()))
+                    response.prefix = True
+                    break
+                chunks.append(await self.read_exactly(length))
+                size += length
+                if await self.read_exactly(2) != b"\r\n":
+                    raise ProbeFailure("invalid_chunk")
+            body = b"".join(chunks)
+        elif lengths:
+            if len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
+                raise ProbeFailure("ambiguous_framing")
+            length = int(lengths[0])
+            if allow_prefix and length > self.remaining_plain():
+                length, response.prefix = self.remaining_plain(), True
+            body = await self.read_exactly(length)
+        else:
+            chunks = [self.buffer]
+            self.buffer = b""
+            while True:
+                if allow_prefix and self.response_bytes >= MAX_PROBE_RESPONSE:
+                    response.prefix = True
+                    break
+                chunk = await self.read_plain()
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            body = b"".join(chunks)
+        content_encodings = headers.get("content-encoding", [])
+        if not content_encodings or (len(content_encodings) == 1 and content_encodings[0].lower() == "identity"):
+            return body
+        if len(content_encodings) != 1 or content_encodings[0].lower() != "gzip":
+            raise ProbeFailure("content_encoding_unsupported")
+        if response.prefix:
+            # A complete small gzip stream can yield a bounded decoded prefix.
+            # Partially received compressed streams are not accepted as checks.
+            raise ProbeFailure("prefix_encoding_unsupported")
+        try:
+            inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            decoded = inflater.decompress(body, MAX_PROBE_RESPONSE + 1)
+            if len(decoded) > MAX_PROBE_RESPONSE or inflater.unconsumed_tail:
+                if allow_prefix:
+                    response.prefix = True
+                    return decoded[:MAX_PROBE_RESPONSE]
+                raise ProbeFailure("response_too_large")
+            if not inflater.eof or inflater.unused_data:
+                raise ProbeFailure("invalid_gzip")
+            return decoded
+        except zlib.error as error:
+            raise ProbeFailure("invalid_gzip") from error
+
+    async def request_response(self, path, on_stage=None, port=443, method="HEAD", read_statuses=None,
+                               allow_prefix=False):
         mark = on_stage or (lambda stage: None)
+        if method not in ("HEAD", "GET", "WSS"):
+            raise ProbeFailure("method_unsupported")
+        if not isinstance(path, str) or not path.startswith("/") or any(ord(char) <= 32 or ord(char) == 127 for char in path):
+            raise ProbeFailure("invalid_path")
         mark("tls")
         await self.operate(self.tls.do_handshake)
         mark("http")
         authority = self.host if port == 443 else f"{self.host}:{port}"
-        request = (f"HEAD {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nUser-Agent: Pathfinder-Probe/0.1\r\n\r\n").encode("ascii")
+        verb = "GET" if method == "WSS" else method
+        headers = [f"{verb} {path} HTTP/1.1", f"Host: {authority}",
+                   "User-Agent: Pathfinder-Probe/0.3", "Accept-Encoding: identity"]
+        if method == "WSS":
+            self.websocket_key = base64.b64encode(os.urandom(16)).decode("ascii")
+            headers.extend(["Connection: Upgrade", "Upgrade: websocket",
+                            f"Sec-WebSocket-Key: {self.websocket_key}", "Sec-WebSocket-Version: 13"])
+        else:
+            headers.append("Connection: close")
+        request = ("\r\n".join(headers) + "\r\n\r\n").encode("ascii")
         offset = 0
         while offset < len(request):
             offset += await self.operate(lambda: self.tls.write(request[offset:]))
-        response = b""
-        while b"\r\n\r\n" not in response:
-            chunk = await self.operate(lambda: self.tls.read(8192))
-            if not chunk:
-                raise EOFError("Empty HTTP response")
-            response += chunk
-            if len(response) > 65536:
-                raise ValueError("HTTP headers too large")
-        line = response.split(b"\r\n", 1)[0].split()
-        if len(line) < 2 or line[0] not in (b"HTTP/1.0", b"HTTP/1.1") or len(line[1]) != 3:
-            raise ValueError("Invalid HTTP status")
-        return int(line[1])
+        for _ in range(5):
+            raw = await self.read_until(b"\r\n\r\n", MAX_PROBE_HEADERS, "headers_too_large")
+            status, response_headers = self.parse_headers(raw)
+            self.status = status
+            if status == 101 or status >= 200:
+                break
+        else:
+            raise ProbeFailure("too_many_interim_responses")
+        response = HTTPResponse(status, response_headers, version=raw.split(b" ", 1)[0].decode("ascii"))
+        if method == "GET" and (read_statuses is None or status in read_statuses):
+            response.body = await self.read_body(response, allow_prefix=allow_prefix)
+        return response
+
+    async def request(self, path, on_stage=None, port=443):
+        """Keep the original status-only HEAD API for proxy integration callers."""
+        response = await self.request_response(path, on_stage, port)
+        return response.status
+
+    def websocket_valid(self, response):
+        if response.status != 101 or response.version != "HTTP/1.1" or not self.websocket_key:
+            return False
+        headers = response.headers
+        upgrades = ",".join(headers.get("upgrade", [])).lower().split(",")
+        connections = ",".join(headers.get("connection", [])).lower().split(",")
+        accept = headers.get("sec-websocket-accept", [])
+        expected = base64.b64encode(hashlib.sha1((self.websocket_key + WEBSOCKET_GUID).encode("ascii")).digest()).decode("ascii")
+        return ("websocket" in [value.strip() for value in upgrades]
+                and "upgrade" in [value.strip() for value in connections]
+                and "sec-websocket-protocol" not in headers
+                and "sec-websocket-extensions" not in headers
+                and accept == [expected])
 
 
 @dataclass
@@ -170,11 +377,15 @@ class ProbeResult:
     latency_ms: int
     status: int = None
     stage: str = ""
+    detail: str = ""
 
 
 async def probe(route, service, timeout):
     started = time.monotonic()
     writer = None
+    tls = None
+    status = None
+    detail = ""
     stage = "connect"
 
     def mark(value):
@@ -182,32 +393,69 @@ async def probe(route, service, timeout):
         stage = value
 
     async def run():
-        nonlocal writer
+        nonlocal writer, tls
+        if ("body_contains" in service and not isinstance(service["body_contains"], str)
+                or "json_keys" in service and (not isinstance(service["json_keys"], list)
+                    or not all(isinstance(key, str) for key in service["json_keys"]))):
+            raise ProbeFailure("invalid_check")
+        allow_prefix = service.get("allow_prefix", False)
+        if not isinstance(allow_prefix, bool) or (allow_prefix and
+                (service.get("probe_method") != "GET" or not service.get("body_contains") or "json_keys" in service)):
+            raise ProbeFailure("invalid_check")
         host = service.get("probe_host") or service["domains"][0].removeprefix("*.")
         port = service.get("port", 443)
         reader, writer = await connect(route, host, port, on_stage=mark)
         tls = TLSProbe(reader, writer, host, route.get("tls_split", False))
-        return await tls.request(service.get("probe_path", "/"), on_stage=mark, port=port)
+        return await tls.request_response(service.get("probe_path", "/"), on_stage=mark, port=port,
+                                          method=service.get("probe_method", "HEAD"),
+                                          read_statuses=service.get("expected_statuses", range(200, 300)),
+                                          allow_prefix=allow_prefix)
 
     try:
-        status = await asyncio.wait_for(run(), timeout)
-        ok = status in service.get("expected_statuses", range(200, 400))
+        response = await asyncio.wait_for(run(), timeout)
+        status = response.status
+        method = service.get("probe_method", "HEAD")
+        expected = service.get("expected_statuses", range(200, 400) if method == "HEAD" else range(200, 300))
+        ok = status in expected
         outcome = "http_reachable" if ok else "http_inconclusive"
-        if not ok and "expected_statuses" not in service and service.get("probe_path", "/") == "/" and status in (400, 401, 404, 405, 409, 410, 429):
+        if method == "WSS":
+            ok = tls.websocket_valid(response)
+            outcome = "websocket_ok" if ok else "http_denied" if status >= 400 else "content_mismatch"
+            detail = "websocket_upgrade_valid" if ok else "websocket_upgrade_invalid"
+        elif method == "GET":
+            outcome = "functional_ok" if ok else "http_denied" if status >= 400 else "content_mismatch"
+            detail = "response_valid" if ok else "status_not_expected"
+            if ok and "body_contains" in service and service["body_contains"].encode("utf-8") not in response.body:
+                ok, outcome, detail = False, "content_mismatch", "body_marker_missing"
+            if ok and "json_keys" in service:
+                try:
+                    payload = json.loads(response.body)
+                except (ValueError, UnicodeError, RecursionError):
+                    ok, outcome, detail = False, "content_mismatch", "invalid_json"
+                else:
+                    if not isinstance(payload, dict) or not all(key in payload for key in service["json_keys"]):
+                        ok, outcome, detail = False, "content_mismatch", "json_keys_missing"
+            if ok and response.prefix:
+                outcome, detail = "content_prefix_ok", "validated_prefix"
+        elif not ok and "expected_statuses" not in service and service.get("probe_path", "/") == "/" and status in (400, 401, 404, 405, 409, 410, 429):
             # A root HEAD rejection is not a transport failure. Let the real
             # authenticated request proceed on this route without probing others.
             ok, outcome = True, "http_response"
     except ssl.SSLCertVerificationError:
-        ok, outcome, status = False, "certificate_error", None
+        ok, outcome, status, detail = False, "certificate_error", None, "certificate_invalid"
+    except ProbeFailure as error:
+        ok, outcome, detail = False, "content_mismatch", error.detail
     except asyncio.TimeoutError:
-        ok, outcome, status = False, f"{stage}_timeout", None
+        ok, outcome, detail = False, f"{stage}_timeout", "timeout"
     except socket.gaierror:
-        ok, outcome, status = False, f"{stage}_error", None
+        ok, outcome, detail = False, f"{stage}_error", "dns_failed"
     except (OSError, EOFError, ValueError):
-        ok, outcome, status = False, f"{stage}_error", None
+        ok, outcome, detail = False, f"{stage}_error", "response_incomplete" if stage == "http" else "connection_failed"
     finally:
+        if status is None and tls is not None:
+            status = tls.status
         await close(writer)
-    return ProbeResult(ok, outcome, int((time.monotonic() - started) * 1000), status, stage)
+    return ProbeResult(ok, outcome, int((time.monotonic() - started) * 1000), status, stage, detail)
 
 
 async def relay(client_reader, client_writer, remote_reader, remote_writer, host, split):

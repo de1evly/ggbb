@@ -1,7 +1,7 @@
 import asyncio
 import time
 from collections import defaultdict
-from .transport import probe
+from .transport import ProbeResult, probe
 from . import __version__
 from .config import TLS_PORTS
 
@@ -34,6 +34,8 @@ class Engine:
         configured = [r for r in self.config.data["routes"] if r.get("enabled", True)]
         native = self.dpi.routes() if self.dpi else []
         native = [r for r in native if r["id"] not in {c["id"] for c in configured}]
+        if self.config.data["bypass_only"]:
+            return native + [r for r in configured if r["kind"] == "socks5"]
         return configured[:1] + native + configured[1:]
 
     def service(self, host, port=443):
@@ -42,7 +44,28 @@ class Engine:
         service = self.config.service(host) or ({"id": host, "domains": [host]} if self.config.data["auto_manage"] or self.config.direct(host) else None)
         if service is None:
             return None
-        return {**service, "id": service["id"] + (f":{port}" if port != 443 else ""), "port": port}
+        service = {**service, "id": service["id"] + (f":{port}" if port != 443 else ""), "port": port}
+        specifications = self.store.probes(self.key, service["id"])
+        if specifications:
+            service["probes"] = specifications
+        return service
+
+    async def probe_service(self, route, service, timeout):
+        """Re-use real scan checks for recovery and health, including grouped hosts."""
+        specifications = service.get("probes")
+        if not specifications:
+            return await self.prober(route, service, timeout)
+        latency = 0
+        last = None
+        prefix = False
+        for specification in specifications:
+            last = await self.prober(route, specification, timeout)
+            latency += last.latency_ms
+            if not last.ok:
+                return last
+            prefix |= last.outcome == "content_prefix_ok"
+        return ProbeResult(True, "content_prefix_ok" if prefix else "functional_ok", latency,
+                           last.status, "service", "validated_prefix" if prefix else "checks_valid")
 
     async def acquire(self, host, port=443):
         service = self.service(host, port)
@@ -104,7 +127,7 @@ class Engine:
             tentative = None
 
             async def check(route):
-                result = await self.prober(route, service, self.config.data["probe_timeout"])
+                result = await self.probe_service(route, service, self.config.data["probe_timeout"])
                 return route, result
 
             def accept(route, result):
@@ -118,7 +141,7 @@ class Engine:
                     self.cooldown.pop(key, None)
                     self.last_failure.pop(key, None)
                     return route, found
-                if result.status is not None and tentative is None:
+                if result.status is not None and tentative is None and not service.get("probes"):
                     tentative = route
                 return None
 
@@ -235,7 +258,7 @@ class Engine:
         results = []
         async with self.search_slots:
             for route in ([DIRECT_ROUTE] if self.config.direct(host) else self.routes()):
-                result = await self.prober(route, service, self.config.data["probe_timeout"])
+                result = await self.probe_service(route, service, self.config.data["probe_timeout"])
                 results.append({"route": route["id"], **vars(result)})
         return results
 
@@ -253,6 +276,9 @@ class Engine:
             service = next((s for s in self.config.data["services"] if s["id"] == base),
                            {"id": base, "domains": [base]})
             service = {**service, "id": choice["service"], "port": int(port_text) if port_text else 443}
+            specifications = self.store.probes(network_key, choice["service"])
+            if specifications:
+                service["probes"] = specifications
             key = (network_key, choice["service"])
             async with self.locks[key]:
                 if self.key != network_key:
@@ -264,14 +290,14 @@ class Engine:
                 if not route:
                     continue
                 async with self.search_slots:
-                    result = await self.prober(route, service, self.config.data["probe_timeout"])
+                    result = await self.probe_service(route, service, self.config.data["probe_timeout"])
                 if self.key != network_key:
                     return
                 self.store.record(*key, route["id"], result.outcome, result.latency_ms, result.status)
                 self.store.verified(*key)
                 if result.ok:
                     self.store.success(*key)
-                elif result.status is None or (choice["evidence"] == "http_reachable" and result.status in (403, 451)):
+                elif service.get("probes") or result.status is None or (choice["evidence"] == "http_reachable" and result.status in (403, 451)):
                     # A changed response is a reason to compare routes, not a diagnosis.
                     self.store.failure(*key)
                     if self.store.get(*key)["failures"] >= self.config.data["failure_threshold"]:
@@ -284,6 +310,7 @@ class Engine:
         return {"version": __version__, "direct_domains": self.config.data["direct_domains"],
                 "dpi": self.dpi.snapshot() if self.dpi else None,
                 "network": self.network, "network_error": self.network_error, "auto_manage": self.config.data["auto_manage"],
+                "bypass_only": self.config.data["bypass_only"],
                 "services": self.config.data["services"], "routes": self.routes(),
                 "proxy_port": self.config.data["proxy_port"],
                 "cooldown": {k[1]: v[0] for k, v in self.cooldown.items() if k[0] == self.key},

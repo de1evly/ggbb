@@ -3,8 +3,11 @@ import hmac
 import json
 import re
 import time
+from collections import deque
 from .config import hostname, endpoint
 from .engine import NoRoute
+from .autoscan import AutoScanner
+from .apps import inspect_apps, launch_discord
 from .transport import close, connect, relay
 
 
@@ -52,6 +55,21 @@ class Servers:
         self.connections = 0
         self.api_connections = 0
         self.tasks = set()
+        self.recent_connections = deque(maxlen=100)
+        self.engine.observed_hosts = {}
+        self.autoscanner = AutoScanner(engine)
+
+    def observe(self, host, port, outcome, route=None):
+        self.engine.observed_hosts[host] = time.time()
+        if len(self.engine.observed_hosts) > 128:
+            oldest = min(self.engine.observed_hosts, key=self.engine.observed_hosts.get)
+            self.engine.observed_hosts.pop(oldest, None)
+        self.recent_connections.append({"at": time.time(), "host": host, "port": port,
+                                        "outcome": outcome, "route": route})
+
+    def status(self):
+        return {**self.engine.snapshot(), "recent_connections": list(self.recent_connections),
+                "auto_scan": self.autoscanner.snapshot() if self.autoscanner else None}
 
     async def proxy(self, reader, writer):
         remote = None
@@ -71,6 +89,7 @@ class Servers:
             if ":" not in target:
                 raise ValueError("CONNECT requires a port")
             name, port = endpoint(target)
+            self.observe(name, port, "proxy_request")
             if not self.engine.service(name, port):
                 await respond(writer, 403, {"error": "Domain is not enrolled"})
                 return
@@ -79,11 +98,13 @@ class Servers:
             try:
                 remote_reader, remote = await asyncio.wait_for(connect(route, name, port), self.engine.config.data["probe_timeout"])
             except (OSError, asyncio.TimeoutError, EOFError):
+                self.observe(name, port, "connect_failed", route["id"])
                 await self.engine.report(name, "transport_error", time.time(), key=key, route_id=route["id"], port=port)
                 raise NoRoute("Не удалось открыть выбранный путь")
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
             established = True
+            self.observe(name, port, "tunnel_open", route["id"])
             # No HTTP parsing/decryption beyond this point, including on error.
             await relay(reader, writer, remote_reader, remote, name, route.get("tls_split", False))
         except NoRoute as error:
@@ -136,7 +157,14 @@ class Servers:
                 await respond(writer, 401, {"error": "Неверный ключ подключения"}, origin)
                 return
             if method == "GET" and target == "/status":
-                await respond(writer, 200, self.engine.snapshot(), origin)
+                await respond(writer, 200, self.status(), origin)
+                return
+            if method == "GET" and target == "/auto-scan":
+                await respond(writer, 200, self.autoscanner.snapshot() if self.autoscanner else None, origin)
+                return
+            if method == "GET" and target == "/apps":
+                result = await asyncio.to_thread(inspect_apps, self.engine.config.data["proxy_port"])
+                await respond(writer, 200, result, origin)
                 return
             if method != "POST":
                 await respond(writer, 405, {"error": "Method unsupported"}, origin)
@@ -156,6 +184,14 @@ class Servers:
                 result = {"route": route, "evidence": choice["evidence"] if choice else "policy_direct"}
             elif target == "/scan":
                 result = {"results": await self.engine.scan(hostname(data.get("host")), data.get("port", 443))}
+            elif target == "/auto-scan":
+                if not self.autoscanner:
+                    raise ValueError("Автосканирование недоступно")
+                result = self.autoscanner.start(data.get("target", "all"))
+            elif target == "/auto-cancel":
+                result = self.autoscanner.cancel()
+            elif target == "/apps/discord":
+                result = await asyncio.to_thread(launch_discord, self.engine.config.data["proxy_port"])
             elif target == "/socks":
                 self.engine.config.set_socks(data.get("port"))
                 result = {"ok": True}
@@ -190,6 +226,7 @@ class Servers:
             self.tasks.discard(task)
 
     async def shutdown(self):
+        await self.autoscanner.shutdown()
         tasks = list(self.tasks)
         for task in tasks:
             task.cancel()

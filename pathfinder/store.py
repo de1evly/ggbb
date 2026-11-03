@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import time
 
@@ -15,6 +16,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS attempts (
               id INTEGER PRIMARY KEY, at REAL, network TEXT, service TEXT,
               route TEXT, outcome TEXT, latency_ms INTEGER, status INTEGER);
+            CREATE TABLE IF NOT EXISTS functional_probes (
+              network TEXT, service TEXT, specifications TEXT,
+              PRIMARY KEY(network, service));
         """)
 
     def get(self, network, service):
@@ -26,6 +30,21 @@ class Store:
         self.db.execute("INSERT OR REPLACE INTO choices VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
                         (network, service, route, now, now + ttl, now, evidence, now))
         self.db.commit()
+        return self.get(network, service)
+
+    def probes(self, network, service):
+        row = self.db.execute("SELECT specifications FROM functional_probes WHERE network=? AND service=?",
+                              (network, service)).fetchone()
+        return json.loads(row[0]) if row else []
+
+    def choose_functional(self, network, service, route, ttl, specifications, evidence="functional_ok"):
+        """Persist the route and the checks that justified it in one transaction."""
+        now = time.time()
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO functional_probes VALUES (?, ?, ?)",
+                            (network, service, json.dumps(specifications, ensure_ascii=False)))
+            self.db.execute("INSERT OR REPLACE INTO choices VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                            (network, service, route, now, now + ttl, now, evidence, now))
         return self.get(network, service)
 
     def touch(self, network, service):

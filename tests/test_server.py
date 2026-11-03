@@ -19,6 +19,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.config = Config(self.root / "config.json")
+        self.config.data["bypass_only"] = False
         self.store = Store(self.root / "state.sqlite3")
         async def good(*args):
             return ProbeResult(True, "http_reachable", 1, 200)
@@ -74,7 +75,31 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"a" * 40, response)
         versioned = await self.request("/proxy.pac?v=0.1.1")
         self.assertIn(b"200 OK", versioned)
-        self.assertIn(b"userapi.com", versioned)
+        self.assertIn(b"*.ru", versioned)
+        self.assertNotIn(b"userapi.com", versioned)
+
+    async def test_auto_scan_api_applies_routes_and_status_exposes_progress(self):
+        denied = await self.request("/auto-scan", method="POST", data={"target": "example.com"})
+        self.assertIn(b"401 Unauthorized", denied)
+        started = await self.request("/auto-scan", token="a" * 40, method="POST", data={"target": "example.com"})
+        self.assertIn(b"200 OK", started)
+        await self.handlers.autoscanner.task
+        result = await self.request("/auto-scan", token="a" * 40)
+        job = json.loads(result.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(job["saved"], 1)
+        self.assertEqual(self.store.get(self.engine.key, "example.com")["evidence"], "functional_ok")
+        self.assertEqual(self.engine.service("example.com")["probes"][0]["probe_method"], "GET")
+        status = await self.request(token="a" * 40)
+        self.assertIn(b'"auto_scan"', status)
+
+    async def test_app_launch_is_authenticated_and_uses_configured_proxy_port(self):
+        with patch("pathfinder.server.launch_discord", return_value={"status": "launched", "message": "ok"}) as launch:
+            self.assertIn(b"401 Unauthorized", await self.request("/apps/discord", method="POST", data={}))
+            launch.assert_not_called()
+            result = await self.request("/apps/discord", token="a" * 40, method="POST", data={})
+            self.assertIn(b"200 OK", result)
+            launch.assert_called_once_with(self.proxy_port)
 
     async def test_event_from_other_network_is_ignored(self):
         import time
@@ -134,6 +159,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(requests), 1)
                 self.assertTrue(requests[0].startswith(b"HEAD / HTTP/1.1"))
                 await close(writer)
+                self.assertTrue(any(row["host"] == "example.com" and row["outcome"] == "tunnel_open"
+                                    for row in self.handlers.recent_connections))
             with patch("pathfinder.transport.connect", local_connect):
                 result = await probe({"id": "direct", "kind": "direct", "family": 4}, {"domains": ["example.com"]}, 3)
                 self.assertFalse(result.ok)
