@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<title>Подключение Pathfinder</title>
+<body>
+  <h1>Подключение к локальному Pathfinder</h1>
+  <p>В консольном меню выберите «Показать ключ для расширения».</p>
+  <form id="pair">
+    <p><label>Ключ <input id="token" type="password" required autocomplete="off" size="48"></label></p>
+    <p><label>Порт API <input id="port" type="number" value="47831" min="1024" max="65535" required></label></p>
+    <button>Подключить</button>
+    <button type="button" id="disconnect">Отключить</button>
+  </form>
+  <p id="status" role="status"></p>
+  <p>Расширение сообщает домен и результат загрузки страниц. Пароли, содержимое страниц и пути URL не передаются. Управление маршрутами находится в консоли.</p>
+  <script src="options.js"></script>
+</body>
+</html>

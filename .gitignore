@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.sqlite3*
+*.log
+*.zip
+token.txt
+config.json
+proxy-backup.json
+.venv/
+dist/
+.DS_Store
