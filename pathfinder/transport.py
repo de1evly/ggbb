@@ -45,7 +45,7 @@ async def connect(route, host, port=443):
         except BaseException:
             await close(writer)
             raise
-    family = socket.AF_INET if route["family"] == 4 else socket.AF_INET6
+    family = {0: socket.AF_UNSPEC, 4: socket.AF_INET, 6: socket.AF_INET6}[route["family"]]
     addresses = await asyncio.get_running_loop().getaddrinfo(host, port, family=family, type=socket.SOCK_STREAM)
     last_error = OSError("No public addresses")
     seen = set()

@@ -43,6 +43,38 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         engine.release(key)
         self.assertEqual(len(self.calls), 1)
 
+    async def test_domestic_sites_skip_probes_and_saved_external_route(self):
+        for host in ("vk.com", "www.wildberries.ru", "esia.gosuslugi.ru", "sun1.userapi.com"):
+            old_key = (self.engine.key, host)
+            self.store.choose(*old_key, "tor-local", 86400)
+            self.good = set()  # Probes fail, but browser's direct path must remain usable.
+            key, route, _ = await self.engine.acquire(host)
+            self.assertEqual(route["id"], "direct-native")
+            self.assertEqual(self.store.get(*key)["evidence"], "policy_direct")
+            self.engine.release(key)
+            self.assertEqual(await self.engine.recover(host), "direct-native")
+            await self.engine.report(host, "transport_error", time.time())
+            self.assertEqual(self.store.get(*key)["failures"], 0)
+        self.assertEqual(self.calls, [])
+
+    async def test_old_config_gets_direct_rules_without_losing_settings(self):
+        data = json.loads(self.config.path.read_text())
+        del data["direct_domains"]
+        data["routes"][-1]["enabled"] = True
+        self.config.path.write_text(json.dumps(data))
+        migrated = Config(self.config.path)
+        self.assertTrue(migrated.direct("vk.com"))
+        self.assertTrue(migrated.direct("gosuslugi.ru"))
+        self.assertTrue(migrated.data["routes"][-1]["enabled"])
+        self.assertIn("direct_domains", json.loads(self.config.path.read_text()))
+
+    async def test_explicit_empty_direct_rules_are_preserved(self):
+        data = json.loads(self.config.path.read_text())
+        data["direct_domains"] = []
+        self.config.path.write_text(json.dumps(data))
+        config = Config(self.config.path)
+        self.assertFalse(config.direct("gosuslugi.ru"))
+
     async def test_new_network_has_separate_choice(self):
         key, _, _ = await self.engine.acquire("example.com")
         self.engine.release(key)

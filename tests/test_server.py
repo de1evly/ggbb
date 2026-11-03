@@ -72,6 +72,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"application/x-ns-proxy-autoconfig", response)
         self.assertIn(b"FindProxyForURL", response)
         self.assertNotIn(b"a" * 40, response)
+        versioned = await self.request("/proxy.pac?v=0.1.1")
+        self.assertIn(b"200 OK", versioned)
+        self.assertIn(b"userapi.com", versioned)
 
     async def test_event_from_other_network_is_ignored(self):
         import time

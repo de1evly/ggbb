@@ -5,8 +5,16 @@ import os
 import re
 from pathlib import Path
 
+DEFAULT_DIRECT_DOMAINS = [
+    "*.ru", "*.su", "*.xn--p1ai",
+    "vk.com", "*.vk.com", "userapi.com", "*.userapi.com",
+    "vk-cdn.net", "*.vk-cdn.net", "yastatic.net", "*.yastatic.net",
+    "yandex.net", "*.yandex.net",
+]
+
 DEFAULT = {
     "auto_manage": True,
+    "direct_domains": DEFAULT_DIRECT_DOMAINS,
     "proxy_port": 47830,
     "api_port": 47831,
     "probe_timeout": 6,
@@ -64,9 +72,24 @@ class Config:
         if not self.path.exists():
             atomic_json(self.path, DEFAULT)
         self.data = json.loads(self.path.read_text(encoding="utf-8"))
+        migrate = "direct_domains" not in self.data
+        self.data.setdefault("direct_domains", DEFAULT_DIRECT_DOMAINS.copy())
         self.validate()
+        if migrate:
+            atomic_json(self.path, self.data)
 
     def validate(self):
+        patterns = self.data["direct_domains"]
+        if not isinstance(patterns, list) or len(patterns) > 256:
+            raise ValueError("direct_domains должен быть списком до 256 шаблонов")
+        for pattern in patterns:
+            if not isinstance(pattern, str):
+                raise ValueError("Некорректный шаблон прямого доступа")
+            if pattern in ("*.ru", "*.su", "*.xn--p1ai"):
+                continue
+            base = pattern.removeprefix("*.")
+            if hostname(base) != base:
+                raise ValueError("Используйте нормализованные домены direct_domains")
         if type(self.data.get("auto_manage")) is not bool:
             raise ValueError("auto_manage должен быть true или false")
         for k, low, high in [("proxy_port", 1024, 65535), ("api_port", 1024, 65535),
@@ -130,11 +153,15 @@ class Config:
 
     @property
     def fingerprint(self):
-        relevant = {"routes": self.data["routes"], "services": self.data["services"]}
+        relevant = {"routes": self.data["routes"], "services": self.data["services"],
+                    "direct_domains": self.data["direct_domains"]}
         return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:16]
 
     def service(self, host):
         return next((s for s in self.data["services"] if any(matches(host, p) for p in s["domains"])), None)
+
+    def direct(self, host):
+        return any(matches(host, p) for p in self.data["direct_domains"])
 
     def add(self, host):
         host = hostname(host)

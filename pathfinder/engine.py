@@ -2,6 +2,9 @@ import asyncio
 import time
 from collections import defaultdict
 from .transport import probe
+from . import __version__
+
+DIRECT_ROUTE = {"id": "direct-native", "kind": "direct", "family": 0}
 
 
 class NoRoute(Exception):
@@ -27,9 +30,20 @@ class Engine:
         return [r for r in self.config.data["routes"] if r.get("enabled", True)]
 
     def service(self, host):
-        return self.config.service(host) or ({"id": host, "domains": [host]} if self.config.data["auto_manage"] else None)
+        return self.config.service(host) or ({"id": host, "domains": [host]} if self.config.data["auto_manage"] or self.config.direct(host) else None)
 
     async def acquire(self, host):
+        if self.config.direct(host):
+            # Guard old PAC caches / manually configured clients too. Never gate
+            # browser traffic on our own TLS trust store or synthetic HEAD here.
+            key = (self.key, host)
+            async with self.locks[key]:
+                choice = self.store.get(*key)
+                if not choice or choice["route"] != DIRECT_ROUTE["id"]:
+                    choice = self.store.choose(*key, DIRECT_ROUTE["id"], self.config.data["cache_seconds"], "policy_direct")
+                self.active[key] += 1
+                self.store.touch(*key)
+                return key, DIRECT_ROUTE.copy(), choice["changed"]
         service = self.service(host)
         if not service:
             raise NoRoute("Домен не добавлен")
@@ -110,6 +124,8 @@ class Engine:
         raise NoRoute("Рабочий способ не найден. См. результаты проверок в расширении")
 
     async def report(self, host, outcome, started, status=None, key=None, route_id=None):
+        if self.config.direct(host):
+            return
         service = self.service(host)
         if not service:
             return
@@ -138,6 +154,10 @@ class Engine:
                     pass
 
     async def recover(self, host):
+        if self.config.direct(host):
+            key, route, _ = await self.acquire(host)
+            self.release(key)
+            return route["id"]
         service = self.service(host)
         if not service:
             raise ValueError("Сначала добавьте домен")
@@ -152,7 +172,7 @@ class Engine:
         service = self.service(host) or {"id": host, "domains": [host]}
         results = []
         async with self.search_slots:
-            for route in self.routes():
+            for route in ([DIRECT_ROUTE] if self.config.direct(host) else self.routes()):
                 result = await self.prober(route, service, self.config.data["probe_timeout"])
                 results.append({"route": route["id"], **vars(result)})
         return results
@@ -197,7 +217,8 @@ class Engine:
                             pass
 
     def snapshot(self):
-        return {"network": self.network, "network_error": self.network_error, "auto_manage": self.config.data["auto_manage"],
+        return {"version": __version__, "direct_domains": self.config.data["direct_domains"],
+                "network": self.network, "network_error": self.network_error, "auto_manage": self.config.data["auto_manage"],
                 "services": self.config.data["services"], "routes": self.routes(),
                 "proxy_port": self.config.data["proxy_port"],
                 "cooldown": {k[1]: v[0] for k, v in self.cooldown.items() if k[0] == self.key},

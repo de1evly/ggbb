@@ -68,7 +68,7 @@ def display_status(state):
         print("Ошибка сети:", state["network_error"])
     print(f"{'Сервис':38} {'Способ':20} {'Сбои':5} Проверка")
     for row in sorted(state["choices"], key=lambda r: r["last_used"], reverse=True)[:25]:
-        evidence = "HTTP доступен" if row["evidence"] == "http_reachable" else "ответ неоднозначен"
+        evidence = {"http_reachable": "HTTP доступен", "policy_direct": "прямой доступ по правилу"}.get(row["evidence"], "ответ неоднозначен")
         print(f"{row['service'][:38]:38} {row['route']:20} {row['failures']:<5} {evidence}")
     if not state["choices"]:
         print("Сохранённых решений пока нет. Откройте сайт или запустите поиск.")
@@ -116,10 +116,13 @@ def ui(directory, activate=False):
                     time.sleep(0.25)
             else:
                 raise RuntimeError("Движок не ответил за 20 секунд")
+        state = client.request("/status")
+        if state.get("version") != __version__:
+            raise RuntimeError("Работает старая версия движка. Завершите её через 0 в старом меню и запустите Pathfinder снова.")
         if activate:
             system_proxy.enable(directory, client.config.data["api_port"])
             proxy_enabled = True
-        print("\nPATHFINDER 0.1 — автоматический подбор пути для HTTPS")
+        print(f"\nPATHFINDER {__version__} — автоматический подбор пути для HTTPS")
         print("Проверка HEAD подтверждает доступность адреса, но не всех функций сервиса.")
         while True:
             print("\n1  Состояние и сохранённые решения\n2  Сканировать способы для домена\n3  Заново выбрать путь\n4  Включить прокси Windows\n5  Выключить / восстановить прокси Windows\n6  Экспортировать диагностику в ZIP\n7  Показать последние события\n8  Показать ключ для расширения\n9  Подключить локальный SOCKS (Tor / другой клиент)\n0  Выйти")

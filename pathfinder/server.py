@@ -126,7 +126,7 @@ class Servers:
             if method == "OPTIONS":
                 await respond(writer, 204, {}, origin)
                 return
-            if method == "GET" and target == "/proxy.pac":
+            if method == "GET" and target.split("?", 1)[0] == "/proxy.pac":
                 from .system_proxy import pac_script
                 body = pac_script(self.engine.config.data).encode("ascii")
                 writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nContent-Length: {len(body)}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n".encode() + body)

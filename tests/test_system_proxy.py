@@ -83,6 +83,18 @@ class ProxySettingsTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             system_proxy.enable(self.root, 47832)
 
+    def test_versioned_pac_upgrade_preserves_original_backup(self):
+        system_proxy.enable(self.root, 47831)
+        backup = self.root / 'proxy-backup.json'
+        old = json.loads(backup.read_text())
+        old['installed']['AutoConfigURL']['value'] = 'http://127.0.0.1:47831/proxy.pac'
+        backup.write_text(json.dumps(old))
+        self.registry.values['AutoConfigURL'] = ('http://127.0.0.1:47831/proxy.pac', 1)
+        system_proxy.enable(self.root, 47831)
+        self.assertIn('?v=0.1.1', self.registry.values['AutoConfigURL'][0])
+        system_proxy.disable(self.root)
+        self.assertEqual(self.registry.values, self.before)
+
     def test_absent_original_values_are_removed(self):
         self.registry.values = {}
         system_proxy.enable(self.root, 47831)
