@@ -64,8 +64,12 @@ def export_diagnostics(client, directory):
             labels[value] = f"service-{len(labels) + 1}"
         return labels[value]
 
+    dpi = state.get("dpi")
+    safe_dpi = {"enabled": dpi["enabled"], "version": dpi["version"], "active": dpi["active"],
+                "error": bool(dpi["error"])} if dpi else None
     redacted = {"version": __version__, "python": platform.python_version(), "os": platform.system(),
                 "auto_manage": state["auto_manage"], "network_error": state["network_error"],
+                "dpi": safe_dpi,
                 "routes": state["routes"], "choices": [], "attempts": []}
     for kind in ("choices", "attempts"):
         for row in state[kind]:
@@ -83,6 +87,7 @@ def display_status(state):
     print(f"\nСеть: {state['network']}  |  Режим: {'все публичные HTTPS-домены' if state['auto_manage'] else 'выбранные домены'}")
     if state["network_error"]:
         print("Ошибка сети:", state["network_error"])
+    display_dpi(state)
     print(f"{'Сервис':38} {'Способ':20} {'Сбои':5} Проверка")
     for row in sorted(state["choices"], key=lambda r: r["last_used"], reverse=True)[:25]:
         evidence = {"http_reachable": "HTTP доступен", "http_response": "TLS + HTTP ответ; функции не проверены",
@@ -90,8 +95,26 @@ def display_status(state):
         print(f"{row['service'][:38]:38} {row['route']:20} {row['failures']:<5} {evidence}")
     if not state["choices"]:
         print("Сохранённых решений пока нет. Откройте сайт или запустите поиск.")
-    if not any(r["kind"] == "socks5" for r in state["routes"]):
+    if not any(r["kind"] == "socks5" and not r.get("local_dpi") for r in state["routes"]):
         print("Внешний выход не подключён. Прямые способы сохраняют IP вашего провайдера.")
+
+
+def display_dpi(state):
+    dpi = state.get("dpi")
+    if not dpi:
+        return
+    if dpi["error"]:
+        print("Обход DPI:", dpi["error"])
+    elif dpi["active"]:
+        print(f"Встроенный ByeDPI {dpi['version']}: " + ", ".join(dpi["active"]))
+    else:
+        print("Встроенный обход DPI отключён в настройках.")
+
+
+def require_dpi_ready(state):
+    dpi = state.get("dpi")
+    if dpi and dpi["enabled"] and not dpi["active"]:
+        raise RuntimeError("Прокси не включён: " + (dpi["error"] or "ByeDPI не запустился"))
 
 
 def ui(directory, activate=False):
@@ -126,7 +149,7 @@ def ui(directory, activate=False):
                                        cwd=Path(__file__).resolve().parent.parent,
                                        stdout=log, stderr=log,
                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            for _ in range(80):
+            for _ in range(160):
                 if process.poll() is not None:
                     raise RuntimeError(f"Не удалось запустить движок. Подробности: {directory / 'backend.log'}")
                 try:
@@ -135,14 +158,16 @@ def ui(directory, activate=False):
                 except (OSError, RuntimeError, ValueError):
                     time.sleep(0.25)
             else:
-                raise RuntimeError("Движок не ответил за 20 секунд")
+                raise RuntimeError("Движок не ответил за 40 секунд")
         state = client.request("/status")
         if state.get("version") != __version__:
             raise RuntimeError("Работает старая версия движка. Завершите её через 0 в старом меню и запустите Pathfinder снова.")
         if activate:
+            require_dpi_ready(state)
             system_proxy.enable(directory, client.config.data["api_port"])
             proxy_enabled = True
         print(f"\nPATHFINDER {__version__} — автоматический подбор пути для HTTPS")
+        display_dpi(state)
         print("Проверка HEAD подтверждает доступность адреса, но не всех функций сервиса.")
         while True:
             print("\n1  Состояние и сохранённые решения\n2  Сканировать способы для домена\n3  Заново выбрать путь\n4  Включить прокси Windows\n5  Выключить / восстановить прокси Windows\n6  Экспортировать диагностику в ZIP\n7  Показать последние события\n8  Показать ключ для расширения\n9  Подключить локальный SOCKS (Tor / другой клиент)\n0  Выйти")
@@ -166,6 +191,7 @@ def ui(directory, activate=False):
                         if result.get("evidence") in ("http_response", "http_inconclusive"):
                             print("Сервер ответил на пробный запрос. Работу самого сервиса нужно проверить в приложении.")
                 elif command == "4":
+                    require_dpi_ready(client.request("/status"))
                     system_proxy.enable(directory, client.config.data["api_port"])
                     proxy_enabled = True
                     print("Включено для приложений, учитывающих системный прокси. При выходе настройки восстановятся.")

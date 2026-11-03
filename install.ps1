@@ -37,7 +37,7 @@ try {
                 Copy-Item (Join-Path $LocalSource $folder) $staging -Recurse
             }
         }
-        foreach ($file in @('README.md', 'LICENSE', 'install.ps1')) {
+        foreach ($file in @('README.md', 'LICENSE', 'THIRD_PARTY.md', 'install.ps1')) {
             if (Test-Path (Join-Path $LocalSource $file)) { Copy-Item (Join-Path $LocalSource $file) $staging }
         }
         Get-ChildItem $staging -Directory -Recurse -Filter '__pycache__' | Remove-Item -Recurse -Force
@@ -84,6 +84,30 @@ try {
         'ARM64' { $arch = 'arm64'; $expected = '5faf08027ec9d0ae7c346465464aa66bbc2f3b54a37d696c54024825ea29d02d' }
         default { throw '64-bit Windows is required.' }
     }
+    # Official ByeDPI v0.17.3 assets. Only the pinned executable is installed;
+    # upstream service scripts are neither copied nor executed.
+    if ($architecture -eq 'AMD64') {
+        $dpiArch = 'x86_64'
+        $dpiArchiveHash = '70d2c94147193cb915f9c6eb5144b8d404dacbcfa90bda2383b6b211afafa456'
+        $dpiExeHash = 'eb53ceeeb981cc6735ac24bb1e51e725280b86630e80fdf19ddc4ee4a5b54ef4'
+    } else {
+        $dpiArch = 'i686'
+        $dpiArchiveHash = '3f3d0af999371cfa623bd641738a42785e107a9d829b38480ed3d942dafea28a'
+        $dpiExeHash = 'cd3a503f3518d1cb3eb5d5d2a4d6a9fbb7f504125969f273413b4507a6315863'
+    }
+    $dpiZip = Join-Path $staging 'byedpi.zip'
+    $dpiUnpacked = Join-Path $staging 'byedpi-unpacked'
+    $dpiBin = Join-Path $staging 'bin'
+    Write-Host 'Downloading bundled ByeDPI 0.17.3 from its official GitHub release ...'
+    Invoke-WebRequest "https://github.com/hufrea/byedpi/releases/download/v0.17.3/byedpi-17.3-$dpiArch-w64.zip" -UseBasicParsing -OutFile $dpiZip
+    if ((Get-FileHash $dpiZip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $dpiArchiveHash) { throw 'ByeDPI archive SHA256 mismatch.' }
+    Expand-Archive $dpiZip $dpiUnpacked
+    $dpiExecutable = Join-Path $dpiUnpacked 'ciadpi.exe'
+    if ((Get-FileHash $dpiExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ne $dpiExeHash) { throw 'ByeDPI executable SHA256 mismatch.' }
+    New-Item -ItemType Directory -Force -Path $dpiBin | Out-Null
+    Copy-Item $dpiExecutable (Join-Path $dpiBin 'ciadpi.exe')
+    Remove-Item $dpiZip
+    Remove-Item $dpiUnpacked -Recurse -Force
     $runtime = Join-Path $InstallDir "python-3.14.10-$arch"
     if (-not (Test-Path (Join-Path $runtime 'python.exe'))) {
         $download = Join-Path $staging 'python.zip'
@@ -99,7 +123,18 @@ try {
     $versions = Join-Path $InstallDir 'versions'
     New-Item -ItemType Directory -Force -Path $versions | Out-Null
     $source = Join-Path $versions $revision
-    if (-not (Test-Path $source)) { Move-Item $staging $source }
+    if (-not (Test-Path $source)) {
+        Move-Item $staging $source
+    } else {
+        $installedBin = Join-Path $source 'bin'
+        $installedDpi = Join-Path $installedBin 'ciadpi.exe'
+        $repairDpi = -not (Test-Path $installedDpi)
+        if (-not $repairDpi) { $repairDpi = (Get-FileHash $installedDpi -Algorithm SHA256).Hash.ToLowerInvariant() -ne $dpiExeHash }
+        if ($repairDpi) {
+            New-Item -ItemType Directory -Force -Path $installedBin | Out-Null
+            Copy-Item (Join-Path $dpiBin 'ciadpi.exe') $installedDpi -Force
+        }
+    }
     $pythonExe = Join-Path $runtime 'python.exe'
     [IO.File]::WriteAllText((Join-Path $runtime 'python314._pth'), "python314.zip`n.`n$source`n", $utf8)
     & $pythonExe -c 'import ssl, sqlite3, pathfinder'

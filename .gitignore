@@ -8,4 +8,5 @@ config.json
 proxy-backup.json
 .venv/
 dist/
+bin/
 .DS_Store

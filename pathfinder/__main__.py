@@ -11,6 +11,7 @@ from .server import Servers
 from .store import Store
 from .transport import STREAM_LIMIT
 from . import __version__
+from .dpi import DPIWorkers
 
 
 async def run(directory):
@@ -27,7 +28,8 @@ async def run(directory):
     network = await detect_network(config.data.get("network_label", ""))
     store = Store(directory / "routes.sqlite3")
     os.chmod(directory / "routes.sqlite3", 0o600)
-    engine = Engine(config, store, network)
+    dpi = DPIWorkers(config.data["dpi_engine_enabled"], (config.data["proxy_port"], config.data["api_port"]))
+    engine = Engine(config, store, network, dpi=dpi)
     handlers = Servers(engine, token)
     proxy = api = None
     monitor_task = None
@@ -51,6 +53,7 @@ async def run(directory):
                 engine.network_error = "Не удалось определить сеть; новые подключения приостановлены"
 
     try:
+        await dpi.start()
         proxy = await asyncio.start_server(handlers.proxy, "127.0.0.1", config.data["proxy_port"], limit=STREAM_LIMIT)
         api = await asyncio.start_server(handlers.api, "127.0.0.1", config.data["api_port"], limit=16384)
         print(f"Pathfinder {__version__} — локальный прототип\nПрокси: 127.0.0.1:{config.data['proxy_port']}\nAPI: 127.0.0.1:{config.data['api_port']}\nДанные: {directory}\nКлюч для расширения: в файле token.txt\nОстановить: Ctrl+C", flush=True)
@@ -69,6 +72,7 @@ async def run(directory):
                 server.close()
                 await server.wait_closed()
         await handlers.shutdown()
+        await dpi.close()
         store.close()
 
 

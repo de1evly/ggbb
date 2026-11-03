@@ -23,6 +23,17 @@ async def connect(route, host, port=443, on_stage=None):
     """Caller bounds total duration. DNS answers are pinned before connecting."""
     mark = on_stage or (lambda stage: None)
     if route["kind"] == "socks5":
+        target = b"\x03" + bytes([len(host.encode("ascii"))]) + host.encode("ascii")
+        if route.get("local_dpi"):
+            # Keep the native worker's blocking DNS resolver out of the data path.
+            # Only our async resolver may select a public IPv4 target for it.
+            mark("dns")
+            addresses = await asyncio.get_running_loop().getaddrinfo(
+                host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+            ip = next((a[4][0] for a in addresses if ipaddress.ip_address(a[4][0]).is_global), None)
+            if ip is None:
+                raise OSError("No public IPv4 address")
+            target = b"\x01" + socket.inet_aton(ip)
         mark("socks_local")
         reader, writer = await asyncio.open_connection(route["host"], route["port"], limit=STREAM_LIMIT)
         try:
@@ -31,9 +42,8 @@ async def connect(route, host, port=443, on_stage=None):
             await writer.drain()
             if await reader.readexactly(2) != b"\x05\x00":
                 raise OSError("SOCKS authentication unsupported")
-            name = host.encode("ascii")
             mark("socks_target")
-            writer.write(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + struct.pack("!H", port))
+            writer.write(b"\x05\x01\x00" + target + struct.pack("!H", port))
             await writer.drain()
             head = await reader.readexactly(4)
             if head[:3] != b"\x05\x00\x00":

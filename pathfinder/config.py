@@ -26,6 +26,7 @@ DEFAULT_DIRECT_DOMAINS = [
 
 DEFAULT = {
     "auto_manage": True,
+    "dpi_engine_enabled": True,
     "direct_domains": DEFAULT_DIRECT_DOMAINS,
     "proxy_port": 47830,
     "api_port": 47831,
@@ -84,8 +85,9 @@ class Config:
         if not self.path.exists():
             atomic_json(self.path, DEFAULT)
         self.data = json.loads(self.path.read_text(encoding="utf-8"))
-        migrate = "direct_domains" not in self.data
+        migrate = "direct_domains" not in self.data or "dpi_engine_enabled" not in self.data
         self.data.setdefault("direct_domains", DEFAULT_DIRECT_DOMAINS.copy())
+        self.data.setdefault("dpi_engine_enabled", True)
         self.validate()
         if migrate:
             atomic_json(self.path, self.data)
@@ -104,6 +106,8 @@ class Config:
                 raise ValueError("Используйте нормализованные домены direct_domains")
         if type(self.data.get("auto_manage")) is not bool:
             raise ValueError("auto_manage должен быть true или false")
+        if type(self.data["dpi_engine_enabled"]) is not bool:
+            raise ValueError("dpi_engine_enabled должен быть true или false")
         for k, low, high in [("proxy_port", 1024, 65535), ("api_port", 1024, 65535),
                              ("probe_timeout", 1, 15), ("search_timeout", 5, 60),
                              ("cache_seconds", 60, 604800), ("failure_threshold", 2, 10),
@@ -165,7 +169,8 @@ class Config:
 
     @property
     def fingerprint(self):
-        relevant = {"probe_policy": 2, "routes": self.data["routes"], "services": self.data["services"],
+        relevant = {"probe_policy": 3, "dpi_engine_enabled": self.data["dpi_engine_enabled"],
+                    "routes": self.data["routes"], "services": self.data["services"],
                     "direct_domains": self.data["direct_domains"]}
         return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:16]
 

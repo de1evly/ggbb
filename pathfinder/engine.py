@@ -15,8 +15,9 @@ class NoRoute(Exception):
 
 
 class Engine:
-    def __init__(self, config, store, network, prober=probe):
+    def __init__(self, config, store, network, prober=probe, dpi=None):
         self.config, self.store, self.network, self.prober = config, store, network, prober
+        self.dpi = dpi
         self.locks = defaultdict(asyncio.Lock)
         self.active = defaultdict(int)
         self.last_failure = {}
@@ -30,7 +31,10 @@ class Engine:
         return self.network + ":" + self.config.fingerprint
 
     def routes(self):
-        return [r for r in self.config.data["routes"] if r.get("enabled", True)]
+        configured = [r for r in self.config.data["routes"] if r.get("enabled", True)]
+        native = self.dpi.routes() if self.dpi else []
+        native = [r for r in native if r["id"] not in {c["id"] for c in configured}]
+        return configured[:1] + native + configured[1:]
 
     def service(self, host, port=443):
         if type(port) is not int or port not in TLS_PORTS:
@@ -98,20 +102,49 @@ class Engine:
 
         async def search():
             tentative = None
+
+            async def check(route):
+                result = await self.prober(route, service, self.config.data["probe_timeout"])
+                return route, result
+
+            def accept(route, result):
+                nonlocal tentative
+                attempts.append({"route": route["id"], **vars(result)})
+                if key[0] != self.key:
+                    raise NoRoute("Сеть изменилась во время проверки")
+                self.store.record(*key, route["id"], result.outcome, result.latency_ms, result.status)
+                if result.ok:
+                    found = self.store.choose(*key, route["id"], self.config.data["cache_seconds"], result.outcome)
+                    self.cooldown.pop(key, None)
+                    self.last_failure.pop(key, None)
+                    return route, found
+                if result.status is not None and tentative is None:
+                    tentative = route
+                return None
+
             async with self.search_slots:
-                for route in routes:
-                    result = await self.prober(route, service, self.config.data["probe_timeout"])
-                    attempts.append({"route": route["id"], **vars(result)})
-                    if key[0] != self.key:
-                        raise NoRoute("Сеть изменилась во время проверки")
-                    self.store.record(*key, route["id"], result.outcome, result.latency_ms, result.status)
-                    if result.ok:
-                        found = self.store.choose(*key, route["id"], self.config.data["cache_seconds"], result.outcome)
-                        self.cooldown.pop(key, None)
-                        self.last_failure.pop(key, None)
-                        return route, found
-                    if result.status is not None and tentative is None:
-                        tentative = route
+                if routes:
+                    # Keep healthy/direct traffic cheap. Only compare alternatives
+                    # after the preferred route fails its synthetic probe.
+                    selected = accept(*(await check(routes[0])))
+                    if selected:
+                        return selected
+                slots = asyncio.Semaphore(3)
+
+                async def limited(route):
+                    async with slots:
+                        return await check(route)
+
+                tasks = [asyncio.create_task(limited(route)) for route in routes[1:]]
+                try:
+                    for completed in asyncio.as_completed(tasks):
+                        selected = accept(*(await completed))
+                        if selected:
+                            return selected
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 # HEAD can be unsupported or denied even though a real page works.
                 # Preserve the ability to load it; label this evidence honestly.
                 if tentative:
@@ -134,7 +167,7 @@ class Engine:
         rounds = min(self.cooldown.get(key, (0, 0))[1] + 1, 5)
         self.cooldown[key] = (time.time() + min(30 * 2 ** (rounds - 1), 300), rounds)
         message = "Доступные способы не ответили. Результаты ниже; последние события — пункт 7."
-        if not any(r["kind"] == "socks5" for r in routes):
+        if not any(r["kind"] == "socks5" and not r.get("local_dpi") for r in routes):
             message += " Внешний выход не подключён: прямые способы сохраняют IP провайдера."
         raise NoRoute(message, attempts)
 
@@ -235,6 +268,7 @@ class Engine:
 
     def snapshot(self):
         return {"version": __version__, "direct_domains": self.config.data["direct_domains"],
+                "dpi": self.dpi.snapshot() if self.dpi else None,
                 "network": self.network, "network_error": self.network_error, "auto_manage": self.config.data["auto_manage"],
                 "services": self.config.data["services"], "routes": self.routes(),
                 "proxy_port": self.config.data["proxy_port"],
