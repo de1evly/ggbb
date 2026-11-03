@@ -123,21 +123,35 @@ class Engine:
                 return None
 
             async with self.search_slots:
-                if routes:
-                    # Keep healthy/direct traffic cheap. Only compare alternatives
-                    # after the preferred route fails its synthetic probe.
-                    selected = accept(*(await check(routes[0])))
-                    if selected:
-                        return selected
                 slots = asyncio.Semaphore(3)
 
                 async def limited(route):
                     async with slots:
                         return await check(route)
 
-                tasks = [asyncio.create_task(limited(route)) for route in routes[1:]]
+                tasks = []
                 try:
-                    for completed in asyncio.as_completed(tasks):
+                    pending = []
+                    if routes:
+                        first = asyncio.create_task(limited(routes[0]))
+                        tasks.append(first)
+                        if any(r.get("local_dpi") for r in routes):
+                            # Give the preferred route a short head start, not a
+                            # full timeout for every new blocked asset domain.
+                            done, _ = await asyncio.wait([first], timeout=0.35)
+                        else:
+                            await first
+                            done = {first}
+                        if done:
+                            selected = accept(*first.result())
+                            if selected:
+                                return selected
+                        else:
+                            pending.append(first)
+                    alternatives = [asyncio.create_task(limited(route)) for route in routes[1:]]
+                    tasks.extend(alternatives)
+                    pending.extend(alternatives)
+                    for completed in asyncio.as_completed(pending):
                         selected = accept(*(await completed))
                         if selected:
                             return selected
