@@ -3,7 +3,7 @@ import hmac
 import json
 import re
 import time
-from .config import hostname
+from .config import hostname, endpoint
 from .engine import NoRoute
 from .transport import close, connect, relay
 
@@ -68,19 +68,18 @@ class Servers:
             if method != "CONNECT" or length:
                 await respond(writer, 405, {"error": "Only HTTPS CONNECT supported"})
                 return
-            name, sep, port = target.rpartition(":")
-            if not sep or port != "443":
-                raise ValueError("Only HTTPS port 443 supported")
-            name = hostname(name)
-            if not self.engine.service(name):
+            if ":" not in target:
+                raise ValueError("CONNECT requires a port")
+            name, port = endpoint(target)
+            if not self.engine.service(name, port):
                 await respond(writer, 403, {"error": "Domain is not enrolled"})
                 return
-            key, route, changed = await self.engine.acquire(name)
+            key, route, changed = await self.engine.acquire(name, port)
             lease = key
             try:
-                remote_reader, remote = await asyncio.wait_for(connect(route, name), self.engine.config.data["probe_timeout"])
+                remote_reader, remote = await asyncio.wait_for(connect(route, name, port), self.engine.config.data["probe_timeout"])
             except (OSError, asyncio.TimeoutError, EOFError):
-                await self.engine.report(name, "transport_error", time.time(), key=key, route_id=route["id"])
+                await self.engine.report(name, "transport_error", time.time(), key=key, route_id=route["id"], port=port)
                 raise NoRoute("Не удалось открыть выбранный путь")
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
@@ -150,9 +149,13 @@ class Servers:
                 self.engine.config.add(data.get("host"))
                 result = self.engine.snapshot()
             elif target == "/recover":
-                result = {"route": await self.engine.recover(hostname(data.get("host")))}
+                host, port = hostname(data.get("host")), data.get("port", 443)
+                route = await self.engine.recover(host, port)
+                service = self.engine.service(host, port)
+                choice = self.engine.store.get(self.engine.key, service["id"])
+                result = {"route": route, "evidence": choice["evidence"] if choice else "policy_direct"}
             elif target == "/scan":
-                result = {"results": await self.engine.scan(hostname(data.get("host")))}
+                result = {"results": await self.engine.scan(hostname(data.get("host")), data.get("port", 443))}
             elif target == "/socks":
                 self.engine.config.set_socks(data.get("port"))
                 result = {"ok": True}
@@ -169,14 +172,14 @@ class Servers:
                 if data.get("network") != self.engine.network:
                     result = {"ignored": "network_changed"}
                 else:
-                    await self.engine.report(hostname(data.get("host")), outcome, started, status)
+                    await self.engine.report(hostname(data.get("host")), outcome, started, status, port=data.get("port", 443))
                     result = {"ok": True}
             else:
                 await respond(writer, 404, {"error": "Unknown endpoint"}, origin)
                 return
             await respond(writer, 200, result, origin)
         except NoRoute as error:
-            await respond(writer, 503, {"error": str(error)}, origin)
+            await respond(writer, 503, {"error": str(error), "attempts": error.attempts}, origin)
         except (ValueError, TypeError, KeyError, UnicodeError, asyncio.LimitOverrunError):
             await respond(writer, 400, {"error": "Некорректный запрос"}, origin)
         except (OSError, EOFError, asyncio.TimeoutError):

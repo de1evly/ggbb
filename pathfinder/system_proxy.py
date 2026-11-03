@@ -3,7 +3,7 @@ import ctypes
 import json
 import os
 from pathlib import Path
-from .config import atomic_json, DEFAULT_DIRECT_DOMAINS
+from .config import atomic_json, DEFAULT_DIRECT_DOMAINS, TLS_PORTS
 from . import __version__
 
 REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
@@ -14,8 +14,13 @@ def pac_script(config):
     patterns = [p for s in config["services"] for p in s["domains"]]
     return """function FindProxyForURL(url, host) {
   host = host.toLowerCase().replace(/[.]$/, "");
-  if (url.substring(0, 6) !== "https:") return "DIRECT";
+  if (!/^(https|wss):[/][/]/.test(url)) return "DIRECT";
   if (host.indexOf(".") < 0 || host.indexOf(":") >= 0 || /^[0-9.]+$/.test(host)) return "DIRECT";
+  var authority = url.split("/")[2];
+  var portMatch = /:([0-9]+)$/.exec(authority);
+  var port = portMatch ? Number(portMatch[1]) : 443;
+  var ports = %s;
+  if (ports.indexOf(port) < 0) return "DIRECT";
   var local = [".localhost", ".local", ".internal", ".lan", ".home", ".test", ".invalid", ".onion"];
   for (var i=0; i<local.length; i++) if (dnsDomainIs(host, local[i])) return "DIRECT";
   var direct = %s;
@@ -29,7 +34,7 @@ def pac_script(config):
   }
   return managed ? "PROXY 127.0.0.1:%d" : "DIRECT";
 }
-""" % (json.dumps(config.get("direct_domains", DEFAULT_DIRECT_DOMAINS)), json.dumps(patterns), "true" if config["auto_manage"] else "false", config["proxy_port"])
+""" % (json.dumps(TLS_PORTS), json.dumps(config.get("direct_domains", DEFAULT_DIRECT_DOMAINS)), json.dumps(patterns), "true" if config["auto_manage"] else "false", config["proxy_port"])
 
 
 def require_windows():

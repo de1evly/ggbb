@@ -5,6 +5,18 @@ import os
 import re
 from pathlib import Path
 
+TLS_PORTS = (443, 8443, 8080)
+
+
+def endpoint(value):
+    """Parse a console domain[:port]; paths and credentials are not accepted."""
+    host, separator, port = value.strip().rpartition(":")
+    if not separator:
+        return hostname(value.strip()), 443
+    if not port.isdecimal() or int(port) not in TLS_PORTS:
+        raise ValueError("Поддерживаются TLS-порты 443, 8443 и 8080")
+    return hostname(host), int(port)
+
 DEFAULT_DIRECT_DOMAINS = [
     "*.ru", "*.su", "*.xn--p1ai",
     "vk.com", "*.vk.com", "userapi.com", "*.userapi.com",
@@ -153,7 +165,7 @@ class Config:
 
     @property
     def fingerprint(self):
-        relevant = {"routes": self.data["routes"], "services": self.data["services"],
+        relevant = {"probe_policy": 2, "routes": self.data["routes"], "services": self.data["services"],
                     "direct_domains": self.data["direct_domains"]}
         return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:16]
 

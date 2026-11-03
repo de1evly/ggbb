@@ -10,8 +10,25 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from . import __version__
-from .config import Config, hostname
+from .config import Config, endpoint
 from . import system_proxy
+
+
+class APIError(RuntimeError):
+    def __init__(self, message, attempts=None):
+        super().__init__(message)
+        self.attempts = attempts or []
+
+
+def display_attempts(results):
+    stages = {"dns": "DNS IPv4", "dns6": "DNS IPv6", "tcp": "TCP-соединение", "tls": "TLS-рукопожатие",
+              "http": "ответ HTTP", "socks_local": "локальный SOCKS", "socks_handshake": "ответ SOCKS",
+              "socks_target": "соединение через SOCKS"}
+    for result in results:
+        stage = stages.get(result.get("stage"), result.get("stage", ""))
+        print(f"{result['route']:20} {result['outcome']:22} HTTP {result.get('status') or '—'}  {result.get('latency_ms', 0)} мс  {stage}")
+    if any(r["outcome"] == "dns6_error" for r in results):
+        print("DNS IPv6: возможно, у домена нет IPv6-адреса; это не означает отказ всего DNS.")
 
 
 class Client:
@@ -30,10 +47,10 @@ class Client:
                 return json.load(response)
         except urllib.error.HTTPError as error:
             try:
-                message = json.load(error).get("error", str(error))
+                payload = json.load(error)
             except ValueError:
-                message = str(error)
-            raise RuntimeError(message) from None
+                payload = {}
+            raise APIError(payload.get("error", str(error)), payload.get("attempts")) from None
 
 
 def export_diagnostics(client, directory):
@@ -68,10 +85,13 @@ def display_status(state):
         print("Ошибка сети:", state["network_error"])
     print(f"{'Сервис':38} {'Способ':20} {'Сбои':5} Проверка")
     for row in sorted(state["choices"], key=lambda r: r["last_used"], reverse=True)[:25]:
-        evidence = {"http_reachable": "HTTP доступен", "policy_direct": "прямой доступ по правилу"}.get(row["evidence"], "ответ неоднозначен")
+        evidence = {"http_reachable": "HTTP доступен", "http_response": "TLS + HTTP ответ; функции не проверены",
+                    "policy_direct": "прямой доступ по правилу"}.get(row["evidence"], "ответ неоднозначен")
         print(f"{row['service'][:38]:38} {row['route']:20} {row['failures']:<5} {evidence}")
     if not state["choices"]:
         print("Сохранённых решений пока нет. Откройте сайт или запустите поиск.")
+    if not any(r["kind"] == "socks5" for r in state["routes"]):
+        print("Внешний выход не подключён. Прямые способы сохраняют IP вашего провайдера.")
 
 
 def ui(directory, activate=False):
@@ -133,16 +153,18 @@ def ui(directory, activate=False):
                 if command == "1":
                     display_status(client.request("/status"))
                 elif command in ("2", "3"):
-                    host = hostname(input("Домен (например, www.youtube.com): ").strip())
+                    host, port = endpoint(input("Домен[:порт] (например, web.telegram.org; TLS-порты 443, 8443, 8080): "))
                     print("Проверяю доступные способы…")
                     if command == "2":
-                        results = client.request("/scan", {"host": host})["results"]
-                        for result in results:
-                            print(f"{result['route']:20} {result['outcome']:22} HTTP {result['status'] or '—'}  {result['latency_ms']} мс")
+                        results = client.request("/scan", {"host": host, "port": port})["results"]
+                        display_attempts(results)
                     else:
                         if not client.config.data["auto_manage"]:
                             client.request("/services", {"host": host})
-                        print("Выбран способ:", client.request("/recover", {"host": host})["route"])
+                        result = client.request("/recover", {"host": host, "port": port})
+                        print("Выбран способ:", result["route"])
+                        if result.get("evidence") in ("http_response", "http_inconclusive"):
+                            print("Сервер ответил на пробный запрос. Работу самого сервиса нужно проверить в приложении.")
                 elif command == "4":
                     system_proxy.enable(directory, client.config.data["api_port"])
                     proxy_enabled = True
@@ -165,6 +187,8 @@ def ui(directory, activate=False):
                     print("Способы обновлены. Сам SOCKS-клиент Pathfinder не устанавливает.")
             except (OSError, ValueError, RuntimeError) as error:
                 print("Ошибка:", error)
+                if isinstance(error, APIError):
+                    display_attempts(error.attempts)
     except (KeyboardInterrupt, EOFError):
         pass
     finally:

@@ -9,6 +9,8 @@ from .engine import Engine
 from .network import detect_network
 from .server import Servers
 from .store import Store
+from .transport import STREAM_LIMIT
+from . import __version__
 
 
 async def run(directory):
@@ -49,9 +51,9 @@ async def run(directory):
                 engine.network_error = "Не удалось определить сеть; новые подключения приостановлены"
 
     try:
-        proxy = await asyncio.start_server(handlers.proxy, "127.0.0.1", config.data["proxy_port"], limit=16384)
+        proxy = await asyncio.start_server(handlers.proxy, "127.0.0.1", config.data["proxy_port"], limit=STREAM_LIMIT)
         api = await asyncio.start_server(handlers.api, "127.0.0.1", config.data["api_port"], limit=16384)
-        print(f"Pathfinder 0.1 — локальный прототип\nПрокси: 127.0.0.1:{config.data['proxy_port']}\nAPI: 127.0.0.1:{config.data['api_port']}\nДанные: {directory}\nКлюч для расширения: в файле token.txt\nОстановить: Ctrl+C", flush=True)
+        print(f"Pathfinder {__version__} — локальный прототип\nПрокси: 127.0.0.1:{config.data['proxy_port']}\nAPI: 127.0.0.1:{config.data['api_port']}\nДанные: {directory}\nКлюч для расширения: в файле token.txt\nОстановить: Ctrl+C", flush=True)
         monitor_task = asyncio.create_task(monitor())
         health_task = asyncio.create_task(health_monitor())
         await asyncio.gather(proxy.serve_forever(), api.serve_forever())
@@ -91,7 +93,7 @@ def main():
         else:
             asyncio.run(run(directory))
     except KeyboardInterrupt:
-        print("Pathfinder остановлен. Отключите его в расширении для обычного доступа.")
+        print("Pathfinder остановлен. Если прокси остался включён, используйте Pathfinder.cmd -RestoreProxy.")
     except (OSError, ValueError, RuntimeError) as error:
         print(f"Ошибка запуска: {error}", file=sys.stderr)
         sys.exit(1)

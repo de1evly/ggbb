@@ -44,7 +44,10 @@ chrome.webRequest.onBeforeRequest.addListener(details => {
   const started = details.timeStamp / 1000;
   pending.set(details.requestId, chrome.storage.session.get(["network", "networkAt"]).then(state => {
     if (!state.network || Date.now() - state.networkAt > 60000) return null;
-    return {host: new URL(details.url).hostname, network: state.network, started};
+    const url = new URL(details.url);
+    const port = Number(url.port || 443);
+    if (![443, 8443, 8080].includes(port)) return null;
+    return {host: url.hostname, port, network: state.network, started};
   }));
 }, {urls: ["https://*/*"], types: ["main_frame"]});
 

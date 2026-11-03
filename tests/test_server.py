@@ -118,7 +118,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         upstream = await asyncio.start_server(target, "127.0.0.1", 0, ssl=server_context)
         upstream_port = upstream.sockets[0].getsockname()[1]
 
-        async def local_connect(*args):
+        async def local_connect(*args, **kwargs):
             return await asyncio.open_connection("127.0.0.1", upstream_port)
 
         try:

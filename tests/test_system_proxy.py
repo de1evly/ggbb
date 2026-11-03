@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from pathfinder import system_proxy
+from pathfinder import __version__
 
 
 class FakeRegistry:
@@ -91,7 +92,7 @@ class ProxySettingsTests(unittest.TestCase):
         backup.write_text(json.dumps(old))
         self.registry.values['AutoConfigURL'] = ('http://127.0.0.1:47831/proxy.pac', 1)
         system_proxy.enable(self.root, 47831)
-        self.assertIn('?v=0.1.1', self.registry.values['AutoConfigURL'][0])
+        self.assertIn('?v=' + __version__, self.registry.values['AutoConfigURL'][0])
         system_proxy.disable(self.root)
         self.assertEqual(self.registry.values, self.before)
 

@@ -3,12 +3,15 @@ import time
 from collections import defaultdict
 from .transport import probe
 from . import __version__
+from .config import TLS_PORTS
 
 DIRECT_ROUTE = {"id": "direct-native", "kind": "direct", "family": 0}
 
 
 class NoRoute(Exception):
-    pass
+    def __init__(self, message, attempts=None):
+        super().__init__(message)
+        self.attempts = attempts or []
 
 
 class Engine:
@@ -29,14 +32,20 @@ class Engine:
     def routes(self):
         return [r for r in self.config.data["routes"] if r.get("enabled", True)]
 
-    def service(self, host):
-        return self.config.service(host) or ({"id": host, "domains": [host]} if self.config.data["auto_manage"] or self.config.direct(host) else None)
+    def service(self, host, port=443):
+        if type(port) is not int or port not in TLS_PORTS:
+            raise ValueError("Поддерживаются TLS-порты 443, 8443 и 8080")
+        service = self.config.service(host) or ({"id": host, "domains": [host]} if self.config.data["auto_manage"] or self.config.direct(host) else None)
+        if service is None:
+            return None
+        return {**service, "id": service["id"] + (f":{port}" if port != 443 else ""), "port": port}
 
-    async def acquire(self, host):
+    async def acquire(self, host, port=443):
+        service = self.service(host, port)
         if self.config.direct(host):
             # Guard old PAC caches / manually configured clients too. Never gate
             # browser traffic on our own TLS trust store or synthetic HEAD here.
-            key = (self.key, host)
+            key = (self.key, host + (f":{port}" if port != 443 else ""))
             async with self.locks[key]:
                 choice = self.store.get(*key)
                 if not choice or choice["route"] != DIRECT_ROUTE["id"]:
@@ -44,7 +53,6 @@ class Engine:
                 self.active[key] += 1
                 self.store.touch(*key)
                 return key, DIRECT_ROUTE.copy(), choice["changed"]
-        service = self.service(host)
         if not service:
             raise NoRoute("Домен не добавлен")
         if self.network_error:
@@ -86,16 +94,19 @@ class Engine:
             failed = choice["failures"] >= threshold
             routes.sort(key=lambda r: (r["id"] == choice["route"]) if failed else (r["id"] != choice["route"]))
 
+        attempts = []
+
         async def search():
             tentative = None
             async with self.search_slots:
                 for route in routes:
                     result = await self.prober(route, service, self.config.data["probe_timeout"])
+                    attempts.append({"route": route["id"], **vars(result)})
                     if key[0] != self.key:
                         raise NoRoute("Сеть изменилась во время проверки")
                     self.store.record(*key, route["id"], result.outcome, result.latency_ms, result.status)
                     if result.ok:
-                        found = self.store.choose(*key, route["id"], self.config.data["cache_seconds"])
+                        found = self.store.choose(*key, route["id"], self.config.data["cache_seconds"], result.outcome)
                         self.cooldown.pop(key, None)
                         self.last_failure.pop(key, None)
                         return route, found
@@ -115,18 +126,22 @@ class Engine:
         except asyncio.TimeoutError:
             result = None
             self.store.record(*key, "search", "search_timeout")
+            attempts.append({"route": "search", "outcome": "search_timeout", "status": None, "latency_ms": 0})
         if result:
             return result
         if choice:
             self.store.invalidate(*key)
         rounds = min(self.cooldown.get(key, (0, 0))[1] + 1, 5)
         self.cooldown[key] = (time.time() + min(30 * 2 ** (rounds - 1), 300), rounds)
-        raise NoRoute("Рабочий способ не найден. См. результаты проверок в расширении")
+        message = "Доступные способы не ответили. Результаты ниже; последние события — пункт 7."
+        if not any(r["kind"] == "socks5" for r in routes):
+            message += " Внешний выход не подключён: прямые способы сохраняют IP провайдера."
+        raise NoRoute(message, attempts)
 
-    async def report(self, host, outcome, started, status=None, key=None, route_id=None):
+    async def report(self, host, outcome, started, status=None, key=None, route_id=None, port=443):
         if self.config.direct(host):
             return
-        service = self.service(host)
+        service = self.service(host, port)
         if not service:
             return
         key = key or (self.key, service["id"])
@@ -153,12 +168,12 @@ class Engine:
                 except NoRoute:
                     pass
 
-    async def recover(self, host):
+    async def recover(self, host, port=443):
         if self.config.direct(host):
-            key, route, _ = await self.acquire(host)
+            key, route, _ = await self.acquire(host, port)
             self.release(key)
             return route["id"]
-        service = self.service(host)
+        service = self.service(host, port)
         if not service:
             raise ValueError("Сначала добавьте домен")
         key = (self.key, service["id"])
@@ -168,8 +183,8 @@ class Engine:
             route, _ = await self.select(key, service)
             return route["id"]
 
-    async def scan(self, host):
-        service = self.service(host) or {"id": host, "domains": [host]}
+    async def scan(self, host, port=443):
+        service = self.service(host, port) or {"id": host, "domains": [host], "port": port}
         results = []
         async with self.search_slots:
             for route in ([DIRECT_ROUTE] if self.config.direct(host) else self.routes()):
@@ -187,8 +202,10 @@ class Engine:
         choices = [row for row in choices if now - row["verified"] >= 120 and now - row["last_used"] <= 900]
         choices.sort(key=lambda row: row["verified"])
         for choice in choices[:8]:
-            service = next((s for s in self.config.data["services"] if s["id"] == choice["service"]),
-                           {"id": choice["service"], "domains": [choice["service"]]})
+            base, _, port_text = choice["service"].partition(":")
+            service = next((s for s in self.config.data["services"] if s["id"] == base),
+                           {"id": base, "domains": [base]})
+            service = {**service, "id": choice["service"], "port": int(port_text) if port_text else 443}
             key = (network_key, choice["service"])
             async with self.locks[key]:
                 if self.key != network_key:

@@ -26,7 +26,7 @@ test('PAC leaves local names, literal IPs and unsupported protocols alone', () =
     assert.equal(route(`https://${host}/`, host), 'DIRECT', host);
   }
   assert.equal(route('http://example.com/', 'example.com'), 'DIRECT');
-  assert.equal(route('wss://example.com/', 'example.com'), 'DIRECT');
+  assert.equal(route('wss://example.com/', 'example.com'), 'PROXY 127.0.0.1:47830');
 });
 
 test('selected-domain PAC respects domain boundaries', () => {
