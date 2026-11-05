@@ -154,7 +154,8 @@ class PacketRunner:
             startup.lpAttributeList = {"handle_list": [parent.value]}
             launch = asyncio.create_task(asyncio.create_subprocess_exec(
                 sys.executable, "-u", "-m", "pathfinder.packet_guard", str(parent.value),
-                str(self.directory), profile_id, json.dumps(self.direct_domains), cwd=self.directory,
+                str(self.directory), profile_id, json.dumps(self.direct_domains),
+                cwd=Path(__file__).resolve().parent.parent,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT, limit=65536, close_fds=True, startupinfo=startup,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))

@@ -100,7 +100,9 @@ class FunctionalProbeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_body_and_json_failures_are_not_successful_routes(self):
         cases = [({"json_keys": ["url"]}, b"<html>challenge</html>", "invalid_json"),
-                 ({"json_keys": ["url"]}, b"[" * 2000 + b"]" * 2000, "invalid_json"),
+                 # Newer Python versions can parse this valid nested array;
+                 # older ones reject its depth. Neither can satisfy API keys.
+                 ({"json_keys": ["url"]}, b"[" * 2000 + b"]" * 2000, ("invalid_json", "json_keys_missing")),
                  ({"json_keys": ["url"]}, b'{"message":"denied"}', "json_keys_missing"),
                  ({"json_keys": ["url"]}, b'["url"]', "json_keys_missing"),
                  ({"body_contains": "real application"}, b"challenge page", "body_marker_missing")]
@@ -108,7 +110,8 @@ class FunctionalProbeTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(detail=detail):
                 result = await self.check({"probe_method": "GET", **fields}, self.response(body))
                 self.assertFalse(result.ok)
-                self.assertEqual((result.outcome, result.detail, result.status), ("content_mismatch", detail, 200))
+                self.assertEqual((result.outcome, result.status), ("content_mismatch", 200))
+                self.assertIn(result.detail, (detail,) if isinstance(detail, str) else detail)
 
     async def test_denial_and_redirect_do_not_count_as_functional_success(self):
         for status in (302, 403, 451, 503):
