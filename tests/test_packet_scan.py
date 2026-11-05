@@ -209,7 +209,7 @@ class PacketScanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["preserved"], 0)
         self.assertEqual(report["selected"], "alt2")
 
-    async def test_network_change_discards_results_and_stops_old_profile(self):
+    async def test_network_change_discards_results_then_retries_freshly(self):
         await self.runner.start("alt4")
         async def changing(route, specification, timeout):
             result = await self.prober(route, specification, timeout)
@@ -218,10 +218,15 @@ class PacketScanTests(unittest.IsolatedAsyncioTestCase):
             return result
         self.scanner.prober = changing
         report = await self.scanner.scan("example.com")
-        self.assertEqual(report["state"], "stale")
-        self.assertFalse(self.runner.alive())
-        self.assertIsNone(report["selected"])
-        self.assertFalse((self.directory / "packet-state.json").exists())
+        self.assertEqual(report["state"], "completed")
+        self.assertEqual(report["selected"], "alt2")
+        self.assertEqual(report["network"], "network-b")
+        self.assertEqual(report["retry_count"], 1)
+        self.assertTrue(report["transition_recovered"])
+        self.assertEqual(report["discarded_attempt"]["stale_reason"], "network_changed")
+        self.assertEqual(sum(profile is None for profile, _ in self.calls), 2)
+        cache = json.loads((self.directory / "packet-state.json").read_text())
+        self.assertEqual({entry["network"] for entry in cache["entries"].values()}, {"network-b"})
 
     async def test_config_change_discards_results(self):
         async def changing(*args):

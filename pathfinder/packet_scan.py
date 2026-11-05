@@ -30,7 +30,10 @@ LIMITS = [
 
 
 class StaleScan(RuntimeError):
-    pass
+    def __init__(self, reason, network=None):
+        super().__init__(reason)
+        self.reason = reason
+        self.network = network
 
 
 class PreflightFailed(RuntimeError):
@@ -54,6 +57,10 @@ class PacketScanner:
         self.detect = detect_func
         self._lock = asyncio.Lock()
         self._accepted = None
+        self._blocked_network = None
+        self._scan_checks = []
+        # PacketRunner captures the exclusions when it is constructed.
+        self._direct_configuration = _digest(self._data().get("direct_domains", []))
         self._report = {"state": "idle", "phase": "idle", "selected": None,
                         "active_profile": None, "passed": 0, "total": 0,
                         "progress": 0, "steps": 0, "results": [], "limits": list(LIMITS)}
@@ -73,8 +80,44 @@ class PacketScanner:
         return await value if inspect.isawaitable(value) else value
 
     async def _unchanged(self, network, configuration):
-        if self._config_digest() != configuration or await self._network() != network:
-            raise StaleScan()
+        if self._config_digest() != configuration:
+            raise StaleScan("config_changed")
+        current = await self._network()
+        if self._config_digest() != configuration:
+            raise StaleScan("config_changed")
+        if current != network:
+            raise StaleScan("network_changed", current)
+
+    async def _stale(self, reason, network=None):
+        await self._stop()
+        self._accepted = None
+        self._blocked_network = network
+        messages = {
+            "network_changed": "Сеть изменилась во время проверки. Результаты этой попытки не применены.",
+            "config_changed": "Настройки изменились. Обход остановлен; перезапустите Pathfinder для их применения.",
+            "network_unstable": "Сеть продолжает меняться. Автоповтор исчерпан; дождитесь стабильного подключения и выберите пункт 2.",
+        }
+        self._report.update(state="stale", phase="finished", selected=None, active_profile=None,
+                            passed=0, stale_reason=reason, finished=time.time(), message=messages[reason])
+
+    async def _stable_network(self, configuration, progress):
+        previous = None
+        self._report.update(state="running", phase="stabilizing", current={},
+                            message="Ожидаю стабильную сеть перед новым подбором.")
+        for attempt in range(6):
+            if self._config_digest() != configuration:
+                raise StaleScan("config_changed")
+            current = await self._network()
+            if self._config_digest() != configuration:
+                raise StaleScan("config_changed")
+            self._report["network_rechecks"] = attempt + 1
+            await self._notify(progress)
+            if current == previous:
+                return current
+            previous = current
+            if attempt < 5:
+                await asyncio.sleep(0.4)
+        raise StaleScan("network_unstable", previous)
 
     async def _preflight(self):
         preflight = getattr(self.runner, "preflight", None)
@@ -315,124 +358,183 @@ class PacketScanner:
         return self.snapshot()
 
     async def scan(self, target="all", progress=None, force=False):
-        """Try global profiles serially; leave only a freshly confirmed one running."""
+        """Select sequentially, with at most one fresh retry on a new network."""
         # Validate before interrupting the currently running profile.
         target, specifications, skipped = self._specifications(target)
         async with self._lock:
-            previous = self.runner.current_profile if self.runner.alive() else None
-            previous_accepted = self._accepted
-            self._report = {"state": "running", "phase": "baseline", "target": target,
-                            "selected": None, "active_profile": previous, "passed": 0,
-                            "total": len(specifications), "progress": 0,
-                            "steps": len(specifications) * (2 * len(PROFILES) + 2), "cached": False,
-                            "baseline": [], "results": [], "confirmation": [], "skipped": skipped,
-                            "started": time.time(), "finished": None, "limits": list(LIMITS),
-                            "message": "Сначала прямой доступ; затем последовательная проверка пакетных профилей."}
-            if not specifications:
-                self._report.update(state="skipped", phase="finished", finished=time.time(),
-                                    message="Домен исключён из обхода политикой прямого доступа; активный профиль не изменён.")
-                await self._notify(progress)
-                return self.snapshot()
-            network = configuration = None
-            self._accepted = None
+            configuration = self._config_digest()
+            self._blocked_network = None
+            prior_checks = self._accepted["checks"] if self._accepted else []
+            if not self._accepted and self._report.get("stale_reason") in ("network_changed", "network_unstable"):
+                prior_checks = self._scan_checks
+            self._scan_checks = self._merge_checks(prior_checks, specifications)
+            if specifications:
+                specifications = self._scan_checks
+            report = await self._scan_once(target, specifications, skipped, progress, force, configuration)
+            if report.get("stale_reason") != "network_changed":
+                return report
+            # Retain diagnostics, never successes, from the invalidated epoch.
+            discarded = {key: copy.deepcopy(report.get(key)) for key in
+                         ("baseline", "results", "confirmation", "total", "stale_reason")}
+            self._report["retry_count"] = 1
             try:
-                network, configuration = await self._network(), self._config_digest()
-                self._report["network"] = network
-                await self._preflight()
-                history = self._history(network, configuration)
-                remembered = [entry for entry in (history, previous_accepted) if entry]
-                if remembered:
-                    prior_checks = [specification for entry in remembered for specification in entry["checks"]]
-                    specifications = self._merge_checks(prior_checks, specifications)
-                self._report.update(total=len(specifications), steps=len(specifications) * (2 * len(PROFILES) + 2))
-                identifiers = {_check_id(specification) for specification in specifications}
-                preserved = set()
-                for entry in remembered:
-                    if entry.get("network") == network and entry.get("configuration") == configuration:
-                        preserved |= set(entry["passed"]) & identifiers
-                self._report["preserved"] = len(preserved)
-                key = _digest({"network": network, "config": configuration, "profiles": PROFILE_VERSION,
-                               "target": target, "checks": specifications})
-                await self._stop()
+                stable = await self._stable_network(configuration, progress)
+                self._report.update(phase="retrying", message="Сеть стабильна. Повторяю весь подбор с исходной проверки.")
                 await self._notify(progress)
-                baseline = await self._checks(specifications, None, progress)
-                self._report["baseline"] = baseline
-                baseline_passed = self._passed(baseline) | preserved
-                await self._unchanged(network, configuration)
-
-                same_scope = history and {_check_id(specification) for specification in history["checks"]} == identifiers
-                cached = None if force else (self._cached_entry(key, specifications) or (history if same_scope else None))
-                candidates = []
-                if cached:
-                    result = await self._candidate(cached["profile"], specifications, progress)
-                    await self._unchanged(network, configuration)
-                    result["eligible"] = not result["error"] and baseline_passed <= self._passed(result["checks"])
-                    self._report["results"].append(result)
-                    if result["eligible"] and set(cached["passed"]) <= self._passed(result["checks"]):
-                        return await self._accept(cached["profile"], result["checks"], key, target, specifications,
-                                                  network, configuration, progress, cached=True)
-                    # A failed cache is evidence, never an accepted fallback.
-                for profile in PROFILES:
-                    result = await self._candidate(profile, specifications, progress)
-                    await self._unchanged(network, configuration)
-                    passed = self._passed(result["checks"])
-                    result["eligible"] = not result["error"] and bool(passed) and baseline_passed <= passed
-                    self._report["results"].append(result)
-                    if result["eligible"]:
-                        latency = sum(row["latency_ms"] for row in result["checks"] if row["ok"])
-                        candidates.append((-len(passed), latency, profile, result))
-                # All candidates see exactly the same checks. The winning
-                # global profile cannot borrow per-host success from another.
-                for _, _, profile, result in sorted(candidates, key=lambda item: item[:3]):
-                    self._report["phase"] = "confirming"
-                    confirmation = await self._candidate(profile, specifications, progress, phase="confirming")
-                    await self._unchanged(network, configuration)
-                    rows = confirmation["checks"]
-                    required = baseline_passed | self._passed(result["checks"])
-                    if not confirmation["error"] and required <= self._passed(rows):
-                        return await self._accept(profile, rows, key, target, specifications,
-                                                  network, configuration, progress)
-                    result["confirmation_failed"] = True
-                await self._restore(previous)
-                self._accepted = previous_accepted
-                self._report.update(state="unresolved", phase="finished", finished=time.time(),
-                                    message="Ни один профиль не прошёл повторную проверку без ухудшения прямого доступа. Прежний профиль восстановлен, если он был запущен.")
-            except StaleScan:
-                await self._stop()
-                self._report.update(state="stale", phase="finished", active_profile=None, finished=time.time(),
-                                    message="Сеть или настройки изменились во время проверки. Результаты не применены; нужна новая проверка.")
-            except PreflightFailed:
-                await self._stop()
-                self._report.update(state="failed", phase="finished", active_profile=None, finished=time.time(),
-                                    error="preflight_failed",
-                                    message="Обнаружен конфликт с другим сетевым инструментом или настройками прокси. Пакетный обход остановлен.")
+                # Run a new baseline and every ALT; never reuse the old matrix.
+                report = await self._scan_once(target, self._scan_checks, skipped, progress, True,
+                                               configuration, retry_count=1, expected_network=stable)
+                if report.get("stale_reason") == "network_changed":
+                    await self._stale("network_unstable", self._blocked_network)
+                self._report["transition_recovered"] = bool(self._report.get("selected"))
+            except StaleScan as error:
+                await self._stale(error.reason, error.network)
             except asyncio.CancelledError:
-                # Each _checks call drains its tasks before control reaches here.
-                # Do not restore a profile after the network has changed.
-                try:
-                    if network is not None and configuration is not None:
-                        await self._unchanged(network, configuration)
-                    await self._restore(previous)
-                    self._accepted = previous_accepted
-                except Exception:
-                    await self._stop()
-                self._report["active_profile"] = self.runner.current_profile if self.runner.alive() else None
-                self._report.update(state="cancelled", phase="finished", finished=time.time(),
-                                    message="Проверка отменена; неподтверждённые результаты не сохранены.")
+                await self._stop()
+                self._accepted = None
+                self._report.update(state="cancelled", phase="finished", selected=None, active_profile=None,
+                                    finished=time.time(), message="Повторный подбор отменён; обход остановлен.")
                 raise
             except Exception:
-                try:
-                    if network is not None and configuration is not None:
-                        await self._unchanged(network, configuration)
-                    await self._restore(previous)
-                    self._accepted = previous_accepted
-                except Exception:
-                    await self._stop()
-                self._report["active_profile"] = self.runner.current_profile if self.runner.alive() else None
-                self._report.update(state="failed", phase="finished", finished=time.time(),
-                                    message="Проверка прервана; неподтверждённые результаты не сохранены.")
+                await self._stop()
+                self._accepted = None
+                self._report.update(state="failed", phase="finished", selected=None, active_profile=None,
+                                    error="network_detection_failed", finished=time.time(),
+                                    message="Не удалось повторить подбор: сеть не определена. Повторите через пункт 2.")
+            self._report["discarded_attempt"] = discarded
             await self._notify(progress)
             return self.snapshot()
+
+    async def _scan_once(self, target, specifications, skipped, progress, force, expected_configuration,
+                         retry_count=0, expected_network=None):
+        previous = self.runner.current_profile if self.runner.alive() else None
+        previous_accepted = self._accepted
+        restore_profile = restore_accepted = None
+        self._report = {"state": "running", "phase": "baseline", "target": target,
+                        "selected": None, "active_profile": previous, "passed": 0,
+                        "retry_count": retry_count,
+                        "total": len(specifications), "progress": 0,
+                        "steps": len(specifications) * (2 * len(PROFILES) + 2), "cached": False,
+                        "baseline": [], "results": [], "confirmation": [], "skipped": skipped,
+                        "started": time.time(), "finished": None, "limits": list(LIMITS),
+                        "message": "Сначала прямой доступ; затем последовательная проверка пакетных профилей."}
+        if not specifications:
+            self._report.update(state="skipped", phase="finished", finished=time.time(),
+                                message="Домен исключён из обхода политикой прямого доступа; активный профиль не изменён.")
+            await self._notify(progress)
+            return self.snapshot()
+        network = configuration = None
+        self._accepted = None
+        try:
+            configuration = expected_configuration
+            if (_digest(self._data().get("direct_domains", [])) != self._direct_configuration
+                    or self._config_digest() != configuration):
+                raise StaleScan("config_changed")
+            network = await self._network()
+            if not previous_accepted or (previous_accepted["network"] == network
+                                         and previous_accepted["configuration"] == configuration):
+                restore_profile, restore_accepted = previous, previous_accepted
+            if expected_network is not None and network != expected_network:
+                raise StaleScan("network_changed", network)
+            await self._unchanged(network, configuration)
+            self._report["network"] = network
+            await self._preflight()
+            history = self._history(network, configuration)
+            remembered = [entry for entry in (history, previous_accepted) if entry]
+            if remembered:
+                prior_checks = [specification for entry in remembered for specification in entry["checks"]]
+                specifications = self._merge_checks(prior_checks, specifications)
+            self._scan_checks = copy.deepcopy(specifications)
+            self._report.update(total=len(specifications), steps=len(specifications) * (2 * len(PROFILES) + 2))
+            identifiers = {_check_id(specification) for specification in specifications}
+            preserved = set()
+            for entry in remembered:
+                if entry.get("network") == network and entry.get("configuration") == configuration:
+                    preserved |= set(entry["passed"]) & identifiers
+            self._report["preserved"] = len(preserved)
+            key = _digest({"network": network, "config": configuration, "profiles": PROFILE_VERSION,
+                           "target": target, "checks": specifications})
+            await self._stop()
+            await self._notify(progress)
+            baseline = await self._checks(specifications, None, progress)
+            self._report["baseline"] = baseline
+            baseline_passed = self._passed(baseline) | preserved
+            await self._unchanged(network, configuration)
+
+            same_scope = history and {_check_id(specification) for specification in history["checks"]} == identifiers
+            cached = None if force else (self._cached_entry(key, specifications) or (history if same_scope else None))
+            candidates = []
+            if cached:
+                result = await self._candidate(cached["profile"], specifications, progress)
+                await self._unchanged(network, configuration)
+                result["eligible"] = not result["error"] and baseline_passed <= self._passed(result["checks"])
+                self._report["results"].append(result)
+                if result["eligible"] and set(cached["passed"]) <= self._passed(result["checks"]):
+                    return await self._accept(cached["profile"], result["checks"], key, target, specifications,
+                                              network, configuration, progress, cached=True)
+                # A failed cache is evidence, never an accepted fallback.
+            for profile in PROFILES:
+                result = await self._candidate(profile, specifications, progress)
+                await self._unchanged(network, configuration)
+                passed = self._passed(result["checks"])
+                result["eligible"] = not result["error"] and bool(passed) and baseline_passed <= passed
+                self._report["results"].append(result)
+                if result["eligible"]:
+                    latency = sum(row["latency_ms"] for row in result["checks"] if row["ok"])
+                    candidates.append((-len(passed), latency, profile, result))
+            # All candidates see exactly the same checks. The winning
+            # global profile cannot borrow per-host success from another.
+            for _, _, profile, result in sorted(candidates, key=lambda item: item[:3]):
+                self._report["phase"] = "confirming"
+                confirmation = await self._candidate(profile, specifications, progress, phase="confirming")
+                await self._unchanged(network, configuration)
+                rows = confirmation["checks"]
+                required = baseline_passed | self._passed(result["checks"])
+                if not confirmation["error"] and required <= self._passed(rows):
+                    return await self._accept(profile, rows, key, target, specifications,
+                                              network, configuration, progress)
+                result["confirmation_failed"] = True
+            await self._unchanged(network, configuration)
+            await self._restore(restore_profile)
+            self._accepted = restore_accepted
+            self._report.update(state="unresolved", phase="finished", finished=time.time(),
+                                message="Ни один профиль не прошёл повторную проверку без ухудшения прямого доступа. Прежний профиль восстановлен, если он был запущен.")
+        except StaleScan as error:
+            await self._stale(error.reason, error.network)
+        except PreflightFailed:
+            await self._stop()
+            self._report.update(state="failed", phase="finished", active_profile=None, finished=time.time(),
+                                error="preflight_failed",
+                                message="Обнаружен конфликт с другим сетевым инструментом или настройками прокси. Пакетный обход остановлен.")
+        except asyncio.CancelledError:
+            # Each _checks call drains its tasks before control reaches here.
+            # Do not restore a profile after the network has changed.
+            try:
+                if network is None or configuration is None:
+                    raise RuntimeError("network_not_confirmed")
+                await self._unchanged(network, configuration)
+                await self._restore(restore_profile)
+                self._accepted = restore_accepted
+            except Exception:
+                await self._stop()
+            self._report["active_profile"] = self.runner.current_profile if self.runner.alive() else None
+            self._report.update(state="cancelled", phase="finished", finished=time.time(),
+                                message="Проверка отменена; неподтверждённые результаты не сохранены.")
+            raise
+        except Exception:
+            try:
+                if network is None or configuration is None:
+                    raise RuntimeError("network_not_confirmed")
+                await self._unchanged(network, configuration)
+                await self._restore(restore_profile)
+                self._accepted = restore_accepted
+            except Exception:
+                await self._stop()
+            self._report["active_profile"] = self.runner.current_profile if self.runner.alive() else None
+            self._report.update(state="failed", phase="finished", finished=time.time(),
+                                message="Проверка прервана; неподтверждённые результаты не сохранены.")
+        await self._notify(progress)
+        return self.snapshot()
 
     async def health(self, progress=None):
         """Recheck accepted successes; rescan when they fail or the network changes."""
@@ -440,13 +542,21 @@ class PacketScanner:
         async with self._lock:
             accepted = self._accepted
             if accepted is None:
+                reason = self._report.get("stale_reason")
+                if reason == "config_changed":
+                    return self.snapshot()
+                if reason == "network_unstable":
+                    # Manual scans can retry immediately; health waits for a
+                    # different network rather than looping on the same one.
+                    if await self._network() == self._blocked_network:
+                        return self.snapshot()
                 rescan = self._report.get("target", "all")
             else:
                 try:
                     await self._preflight()
                     await self._unchanged(accepted["network"], accepted["configuration"])
                     if not self.runner.alive() or self.runner.current_profile != accepted["profile"]:
-                        raise StaleScan()
+                        raise RuntimeError("packet_process_exited")
                     if self._report.get("target") != accepted["target"]:
                         self._report["results"] = []
                     self._report.update(state="running", phase="health", progress=0, steps=len(accepted["checks"]),
@@ -460,7 +570,10 @@ class PacketScanner:
                                                   accepted["checks"], accepted["network"], accepted["configuration"],
                                                   progress, cached=True)
                     rescan = accepted["target"]
-                except StaleScan:
+                except StaleScan as error:
+                    if error.reason == "config_changed":
+                        await self._stale(error.reason)
+                        return self.snapshot()
                     await self._stop()
                     rescan = accepted["target"]
                 except PreflightFailed:
