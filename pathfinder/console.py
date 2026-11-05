@@ -196,22 +196,8 @@ def automatic_setup(client, proxy_enabled, target="all"):
 def ui(directory, activate=False):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    # OS-backed lock is released even if the console crashes.
-    lock = (directory / "console.lock").open("a+b")
-    lock.seek(0)
-    lock.write(b"0")
-    lock.flush()
-    lock.seek(0)
-    try:
-        if os.name == "nt":
-            import msvcrt
-            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        lock.close()
-        raise RuntimeError("Консоль Pathfinder уже запущена") from None
+    from .instance_lock import acquire
+    lock = acquire(directory)
     client = Client(directory)
     process = None
     log = None

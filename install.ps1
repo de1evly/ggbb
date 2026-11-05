@@ -6,6 +6,7 @@ param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'PathfinderApp'),
     [string]$LocalSource = '',
     [switch]$PrivateRepository,
+    [switch]$PacketMode,
     [switch]$NoLaunch
 )
 $ErrorActionPreference = 'Stop'
@@ -108,6 +109,37 @@ try {
     Copy-Item $dpiExecutable (Join-Path $dpiBin 'ciadpi.exe')
     Remove-Item $dpiZip
     Remove-Item $dpiUnpacked -Recurse -Force
+    # Optional packet mode uses only these pinned upstream files. Downloading
+    # them does not load the WinDivert driver or enable packet interception.
+    # ARM64 requires changes to Windows boot protection in the upstream bundle;
+    # this installer leaves that platform on the existing proxy mode instead.
+    $packetManifest = $null
+    if ($architecture -eq 'AMD64') {
+        $packetManifest = Get-Content (Join-Path $staging 'pathfinder\packet_manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $packetAllowed = @('winws2.exe', 'cygwin1.dll', 'WinDivert.dll', 'WinDivert64.sys', 'lua/zapret-lib.lua', 'lua/zapret-antidpi.lua')
+        if ($packetManifest.schema -ne 1 -or $packetManifest.architecture -ne 'AMD64' -or
+            $packetManifest.repository -cne 'bol-van/zapret-win-bundle' -or
+            $packetManifest.revision -cnotmatch '^[0-9a-f]{40}$' -or
+            @($packetManifest.files).Count -ne $packetAllowed.Count) { throw 'Invalid packet component manifest.' }
+        $packetSeen = @{}
+        foreach ($component in $packetManifest.files) {
+            if ($component.path -cnotin $packetAllowed -or $packetSeen.ContainsKey($component.path) -or
+                $component.source -cne ('zapret-winws/' + $component.path) -or
+                $component.sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Invalid packet component entry.' }
+            $packetSeen[$component.path] = $true
+        }
+        Write-Host 'Downloading verified zapret2 files for optional packet mode (Windows x64) ...'
+        $packetBin = Join-Path $dpiBin 'zapret2'
+        foreach ($component in $packetManifest.files) {
+            $packetDestination = Join-Path $packetBin $component.path
+            New-Item -ItemType Directory -Force -Path (Split-Path $packetDestination) | Out-Null
+            $packetUrl = 'https://raw.githubusercontent.com/' + $packetManifest.repository + '/' + $packetManifest.revision + '/' + $component.source
+            Invoke-WebRequest $packetUrl -UseBasicParsing -OutFile $packetDestination
+            if ((Get-FileHash $packetDestination -Algorithm SHA256).Hash.ToLowerInvariant() -cne $component.sha256) {
+                throw ('Packet component SHA256 mismatch: ' + $component.path)
+            }
+        }
+    }
     $runtime = Join-Path $InstallDir "python-3.14.10-$arch"
     if (-not (Test-Path (Join-Path $runtime 'python.exe'))) {
         $download = Join-Path $staging 'python.zip'
@@ -134,6 +166,17 @@ try {
             New-Item -ItemType Directory -Force -Path $installedBin | Out-Null
             Copy-Item (Join-Path $dpiBin 'ciadpi.exe') $installedDpi -Force
         }
+        if ($packetManifest) {
+            foreach ($component in $packetManifest.files) {
+                $installedPacket = Join-Path (Join-Path $installedBin 'zapret2') $component.path
+                $repairPacket = -not (Test-Path $installedPacket -PathType Leaf)
+                if (-not $repairPacket) { $repairPacket = (Get-FileHash $installedPacket -Algorithm SHA256).Hash.ToLowerInvariant() -cne $component.sha256 }
+                if ($repairPacket) {
+                    New-Item -ItemType Directory -Force -Path (Split-Path $installedPacket) | Out-Null
+                    Copy-Item (Join-Path $packetBin $component.path) $installedPacket -Force
+                }
+            }
+        }
     }
     $pythonExe = Join-Path $runtime 'python.exe'
     [IO.File]::WriteAllText((Join-Path $runtime 'python314._pth'), "python314.zip`n.`n$source`n", $utf8)
@@ -144,10 +187,27 @@ try {
     [IO.File]::WriteAllText((Join-Path $InstallDir 'current.json'), $current, $utf8)
     $launcher = @'
 #requires -Version 5.1
-param([switch]$NoProxy, [switch]$RestoreProxy)
+param([switch]$NoProxy, [switch]$RestoreProxy, [switch]$PacketMode)
 $ErrorActionPreference = 'Stop'
 $current = Get-Content (Join-Path $PSScriptRoot 'current.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-if ($RestoreProxy) {
+if ($PacketMode -and ($NoProxy -or $RestoreProxy)) { throw 'Use PacketMode separately from NoProxy and RestoreProxy.' }
+if ($PacketMode) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        & $current.python -m pathfinder packet
+    } else {
+        # UAC is required by WinDivert. Keep the original user's data directory
+        # when Windows prompts for a different administrator account.
+        $dataDir = Join-Path $env:LOCALAPPDATA 'Pathfinder'
+        if ($dataDir.Contains('"')) { throw 'Invalid data directory.' }
+        $ownerSid = $identity.User.Value
+        if ($ownerSid -notmatch '^S-[0-9-]+$') { throw 'Invalid Windows user SID.' }
+        $arguments = '-m pathfinder packet --owner-sid ' + $ownerSid + ' --data-dir "' + $dataDir + '"'
+        $child = Start-Process -FilePath $current.python -ArgumentList $arguments -Verb RunAs -Wait -PassThru
+        if ($child.ExitCode -ne 0) { throw ('Packet mode stopped with code ' + $child.ExitCode + '. Run from an administrator terminal to see the error.') }
+    }
+} elseif ($RestoreProxy) {
     & $current.python -m pathfinder restore-proxy
 } elseif ($NoProxy) {
     & $current.python -m pathfinder ui
@@ -160,7 +220,11 @@ if ($RestoreProxy) {
     [IO.File]::WriteAllText((Join-Path $InstallDir 'Pathfinder.cmd'), $cmd, [Text.Encoding]::ASCII)
     Write-Host "Installed: $InstallDir"
     Write-Host "Launch: $InstallDir\Pathfinder.cmd"
-    if (-not $NoLaunch) { & (Join-Path $InstallDir 'Pathfinder.cmd') }
+    Write-Host "System mode with ALT selection: $InstallDir\Pathfinder.cmd -PacketMode"
+    if (-not $NoLaunch) {
+        if ($PacketMode) { & (Join-Path $InstallDir 'Pathfinder.cmd') -PacketMode }
+        else { & (Join-Path $InstallDir 'Pathfinder.cmd') }
+    }
 } finally {
     if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
 }

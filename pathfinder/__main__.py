@@ -81,8 +81,9 @@ def main():
         if not stream.isatty() and hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Pathfinder — адаптивный локальный HTTPS-прокси")
-    parser.add_argument("command", nargs="?", choices=["ui", "serve", "restore-proxy"], default="ui")
+    parser.add_argument("command", nargs="?", choices=["ui", "serve", "packet", "restore-proxy"], default="ui")
     parser.add_argument("--activate", action="store_true", help="Включить прокси Windows на время работы меню")
+    parser.add_argument("--owner-sid", help=argparse.SUPPRESS)
     parser.add_argument("--data-dir", type=Path, default=Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local" / "share")) / "Pathfinder")
     args = parser.parse_args()
     try:
@@ -90,6 +91,9 @@ def main():
         if args.command == "ui":
             from .console import ui
             ui(directory, args.activate)
+        elif args.command == "packet":
+            from .packet_console import ui
+            asyncio.run(ui(directory, args.owner_sid))
         elif args.command == "restore-proxy":
             from .system_proxy import disable
             disable(directory)
@@ -100,6 +104,11 @@ def main():
         print("Pathfinder остановлен. Если прокси остался включён, используйте Pathfinder.cmd -RestoreProxy.")
     except (OSError, ValueError, RuntimeError) as error:
         print(f"Ошибка запуска: {error}", file=sys.stderr)
+        if args.command == "packet" and args.owner_sid and sys.stdin.isatty():
+            try:
+                input("Нажмите Enter, чтобы закрыть окно.")
+            except (KeyboardInterrupt, EOFError):
+                pass
         sys.exit(1)
 
 

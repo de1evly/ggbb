@@ -1,6 +1,8 @@
 name: Checks
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 permissions:
   contents: read
 jobs:
@@ -21,8 +23,11 @@ jobs:
       - run: node --test tests/test_pac.cjs
       - run: node --check extension/background.js
       - if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: ./tests/check_installer.ps1
       - if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: ./install.ps1 -LocalSource . -InstallDir "$env:RUNNER_TEMP/PathfinderInstall" -NoLaunch
+      - if: runner.os == 'Windows'
+        shell: powershell
+        run: ./tests/check_packet_component.ps1 -InstallDir "$env:RUNNER_TEMP/PathfinderInstall"
